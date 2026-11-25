@@ -1512,12 +1512,34 @@ public:
                     const int v = std::atoi(ov);
                     if (v >= 64 && v <= 4096) user_chunk = v;
                 }
+                // Batch scratch scales with the chunk, and on a nearly-full card it OOMs hard: measured on this
+                // 12 GiB device (982 MiB post-load free) chunk 512 works and chunk 1024 dies with
+                // "[ink-hip] scratch alloc: out of memory". Validate the request against the engine's own scratch
+                // estimate and halve it until it fits in half the free VRAM (the rest absorbs fragmentation).
+                if (user_chunk > 0) {
+                    ink2::BatchGeom bg;
+                    bg.hidden = c_.hidden; bg.n_head = c_.n_head; bg.head_dim = c_.head_dim; bg.n_kv = c_.n_kv;
+                    bg.d_rel = c_.d_rel; bg.rel_extent = c_.rel_extent; bg.inter = c_.inter;
+                    bg.n_experts = c_.n_experts; bg.top_k = c_.top_k;
+                    const size_t budget = post_free / 2;
+                    int allowed = user_chunk;
+                    while (allowed > 64 && estimate_batch_scratch_bytes(bg, allowed) > budget) allowed /= 2;
+                    if (allowed != user_chunk) {
+                        std::fprintf(stderr,
+                                     "[ink-hip] STRATA_MAX_PREFILL_CHUNK=%d clamped to %d: batch scratch "
+                                     "%.0f MiB exceeds half of the %.0f MiB post-load free VRAM\n",
+                                     user_chunk, allowed, estimate_batch_scratch_bytes(bg, user_chunk) / 1048576.0,
+                                     post_free / 1048576.0);
+                    }
+                    user_chunk = allowed;
+                }
                 if (user_chunk > 0) {
                     if (guard_.max_prefill_chunk != user_chunk) {
                         guard_.max_prefill_chunk = user_chunk;
                         std::fprintf(stderr,
                                      "[ink-hip] max_prefill_chunk=%d from STRATA_MAX_PREFILL_CHUNK (post-load free=%.0f MiB; "
-                                     "faster prefill, slower long-context decode)\n",
+                                     "faster prefill, slower long-context decode; pass --chunk=<same value> so the SWA KV "
+                                     "ring margin grows to match, otherwise forward_batch re-splits at the old span cap)\n",
                                      user_chunk, post_free / 1048576.0);
                     }
                 } else if (tight_vram) {
