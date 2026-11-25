@@ -1181,6 +1181,128 @@ __global__ void __launch_bounds__(128) k_sf4_sdot4_tiled(
 }
 
 // =================================================================================================
+// ---------------------------------------------------------------------------------------------
+// Candidate v2: KB K-blocks (16 elements each) per sync, BMxBN output tile, 256 threads,
+// per-thread TMxTN register tile. Same int8 quantization and same per-block fma order as the original => identical results.
+// ---------------------------------------------------------------------------------------------
+template <int BM, int BN, int KB>
+__global__ void __launch_bounds__(256) k_sf4_sdot4_v2(
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ scales, float outer_scale,
+    const half_t* __restrict__ X, float* __restrict__ Y, int M, int N, int K) {
+    constexpr int TM = 4;
+    constexpr int TN = (BM * BN) / (256 * TM);
+    constexpr int PAD = 4;                       // ints of row padding (bank-conflict relief)
+    constexpr int RS = KB * 4 + PAD;             // row stride in ints
+    __shared__ alignas(16) int sXq[BM * RS];
+    __shared__ alignas(16) int sWq[BN * RS];
+    __shared__ float sXd[BM * KB];
+    __shared__ float sWs[BN * KB];
+
+    const int tid = threadIdx.x;
+    const int m_blk = blockIdx.y * BM;
+    const int n_blk = blockIdx.x * BN;
+    const float half_outer = 0.5f * outer_scale;
+    constexpr int COLS = BN / TN;                // threads per tile row
+    const int t_row = (tid / COLS) * TM;
+    const int t_col = (tid % COLS) * TN;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+    const int nblk16 = K >> 4;
+    for (int gb0 = 0; gb0 < nblk16; gb0 += KB) {
+        const int nb = min(KB, nblk16 - gb0);
+        // ---- stage X: BM*KB 16-element blocks, quantized to int8 with per-block scale
+        for (int t = tid; t < BM * KB; t += 256) {
+            const int r = t / KB, kb = t % KB;
+            const int gm = m_blk + r;
+            int4 p4 = make_int4(0, 0, 0, 0);
+            float d = 0.0f;
+            if (gm < M && kb < nb) {
+                const half_t* src = X + static_cast<size_t>(gm) * K + ((gb0 + kb) << 4);
+                const uint4 u0 = *reinterpret_cast<const uint4*>(src);
+                const uint4 u1 = *reinterpret_cast<const uint4*>(src + 8);
+                float xf[16];
+                h2_unpack(u0.x, xf[0], xf[1]);   h2_unpack(u0.y, xf[2], xf[3]);
+                h2_unpack(u0.z, xf[4], xf[5]);   h2_unpack(u0.w, xf[6], xf[7]);
+                h2_unpack(u1.x, xf[8], xf[9]);   h2_unpack(u1.y, xf[10], xf[11]);
+                h2_unpack(u1.z, xf[12], xf[13]); h2_unpack(u1.w, xf[14], xf[15]);
+                float am = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) am = fmaxf(am, fabsf(xf[i]));
+                d = am * (1.0f / 127.0f);
+                const float inv = am > 0.0f ? (127.0f / am) : 0.0f;
+                p4.x = pack4_i8(clamp_i8(xf[0] * inv), clamp_i8(xf[1] * inv), clamp_i8(xf[2] * inv), clamp_i8(xf[3] * inv));
+                p4.y = pack4_i8(clamp_i8(xf[4] * inv), clamp_i8(xf[5] * inv), clamp_i8(xf[6] * inv), clamp_i8(xf[7] * inv));
+                p4.z = pack4_i8(clamp_i8(xf[8] * inv), clamp_i8(xf[9] * inv), clamp_i8(xf[10] * inv), clamp_i8(xf[11] * inv));
+                p4.w = pack4_i8(clamp_i8(xf[12] * inv), clamp_i8(xf[13] * inv), clamp_i8(xf[14] * inv), clamp_i8(xf[15] * inv));
+            }
+            *reinterpret_cast<int4*>(&sXq[r * RS + kb * 4]) = p4;
+            sXd[r * KB + kb] = d;
+        }
+        // ---- stage W: BN*KB blocks of 16 SF4 weights -> int8 (x2 exact), with block scale
+        for (int t = tid; t < BN * KB; t += 256) {
+            const int r = t / KB, kb = t % KB;
+            const int gn = n_blk + r;
+            int4 p4 = make_int4(0, 0, 0, 0);
+            float s = 0.0f;
+            if (gn < N && kb < nb) {
+                const int gb = gb0 + kb;
+                s = e4m3fn_to_f32(scales[static_cast<size_t>(gn) * nblk16 + gb]) * half_outer;
+                const uint2 raw = *reinterpret_cast<const uint2*>(packed + static_cast<size_t>(gn) * (K >> 1) + gb * 8);
+                p4.x = pack4_i8(sf4_e2m1_i8_x2(raw.x & 15u), sf4_e2m1_i8_x2((raw.x >> 4) & 15u),
+                                sf4_e2m1_i8_x2((raw.x >> 8) & 15u), sf4_e2m1_i8_x2((raw.x >> 12) & 15u));
+                p4.y = pack4_i8(sf4_e2m1_i8_x2((raw.x >> 16) & 15u), sf4_e2m1_i8_x2((raw.x >> 20) & 15u),
+                                sf4_e2m1_i8_x2((raw.x >> 24) & 15u), sf4_e2m1_i8_x2((raw.x >> 28) & 15u));
+                p4.z = pack4_i8(sf4_e2m1_i8_x2(raw.y & 15u), sf4_e2m1_i8_x2((raw.y >> 4) & 15u),
+                                sf4_e2m1_i8_x2((raw.y >> 8) & 15u), sf4_e2m1_i8_x2((raw.y >> 12) & 15u));
+                p4.w = pack4_i8(sf4_e2m1_i8_x2((raw.y >> 16) & 15u), sf4_e2m1_i8_x2((raw.y >> 20) & 15u),
+                                sf4_e2m1_i8_x2((raw.y >> 24) & 15u), sf4_e2m1_i8_x2((raw.y >> 28) & 15u));
+            }
+            *reinterpret_cast<int4*>(&sWq[r * RS + kb * 4]) = p4;
+            sWs[r * KB + kb] = s;
+        }
+        __syncthreads();
+        for (int kb = 0; kb < nb; ++kb) {
+            int4 a[TM]; float xd[TM];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                a[i] = *reinterpret_cast<const int4*>(&sXq[(t_row + i) * RS + kb * 4]);
+                xd[i] = sXd[(t_row + i) * KB + kb];
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int4 b = *reinterpret_cast<const int4*>(&sWq[(t_col + j) * RS + kb * 4]);
+                const float ws = sWs[(t_col + j) * KB + kb];
+#pragma unroll
+                for (int i = 0; i < TM; ++i) {
+                    int idot = 0;
+                    idot = sdot4_i32(a[i].x, b.x, idot);
+                    idot = sdot4_i32(a[i].y, b.y, idot);
+                    idot = sdot4_i32(a[i].z, b.z, idot);
+                    idot = sdot4_i32(a[i].w, b.w, idot);
+                    acc[i][j] = fmaf(static_cast<float>(idot), xd[i] * ws, acc[i][j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gm = m_blk + t_row + i;
+        if (gm < M) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int gn = n_blk + t_col + j;
+                if (gn < N) Y[static_cast<size_t>(gm) * N + gn] = acc[i][j];
+            }
+        }
+    }
+}
+
 // 2. MX8 (Lossless MXFP8: F8_E4M3FN + UE8M0/32w) Multi-Gen Kernels (Layers 20..23)
 // =================================================================================================
 
@@ -2640,6 +2762,86 @@ __global__ void __launch_bounds__(128) k_bf16_fdot2_tiled(
     }
 }
 
+// RDNA2 zero-WMMA fdot2 bf16 GEMM (v2): stages KB K-blocks of 32 elements per sync, BMxBN output tile,
+// 256 threads, TMxTN register tile. Same int16 conversion and same per-block fdot2 order as k_bf16_fdot2_tiled
+// => bit-identical results.
+template <int BM, int BN, int KB>
+__global__ void __launch_bounds__(256) k_bf16_fdot2_v2(
+    const uint16_t* __restrict__ W,
+    const float* __restrict__ X,
+    const float* __restrict__ bias,
+    float* __restrict__ Y,
+    int M, int N, int K) {
+    constexpr int BK = 32;
+    constexpr int TM = 4;
+    constexpr int TN = (BM * BN) / (256 * TM);
+    constexpr int COLS = BN / TN;
+    __shared__ alignas(16) half_t sXf[BM * KB * BK];
+    __shared__ alignas(16) half_t sWf[BN * KB * BK];
+    const int tid = threadIdx.x;
+    const int m_blk = blockIdx.y * BM;
+    const int n_blk = blockIdx.x * BN;
+    const int t_row = (tid / COLS) * TM;
+    const int t_col = (tid % COLS) * TN;
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+
+    for (int gb0 = 0; gb0 < K; gb0 += KB * BK) {
+        const int nb = min(KB, (K - gb0 + BK - 1) / BK);
+        for (int t = tid; t < BM * nb * BK; t += 256) {
+            const int r = t / (nb * BK);
+            const int rem = t % (nb * BK);
+            const int kb = rem / BK, c = rem % BK;
+            const int gm = m_blk + r;
+            const int k_abs = gb0 + kb * BK + c;
+            sXf[r * (KB * BK) + kb * BK + c] = (gm < M && k_abs < K)
+                ? static_cast<half_t>(X[static_cast<size_t>(gm) * K + k_abs]) : static_cast<half_t>(0.0f);
+        }
+        for (int t = tid; t < BN * nb * BK; t += 256) {
+            const int r = t / (nb * BK);
+            const int rem = t % (nb * BK);
+            const int kb = rem / BK, c = rem % BK;
+            const int gn = n_blk + r;
+            const int k_abs = gb0 + kb * BK + c;
+            sWf[r * (KB * BK) + kb * BK + c] = (gn < N && k_abs < K)
+                ? static_cast<half_t>(bf16_to_f32(W[static_cast<size_t>(gn) * K + k_abs])) : static_cast<half_t>(0.0f);
+        }
+        __syncthreads();
+        // Fragment hoisting: each operand fragment is read from LDS ONCE per q and reused across the
+        // whole TMxTN register tile (was: both operands re-loaded per (i,j) pair = 2 LDS per fdot2).
+        // Bit-identical: every acc[i][j] still walks q = 0..BK/2-1 ascending inside each ascending kb.
+        for (int kb = 0; kb < nb; ++kb) {
+            const int kb0 = kb * BK;
+#pragma unroll
+            for (int q = 0; q < BK / 2; ++q) {
+                uint32_t xf[TM], wf[TN];
+#pragma unroll
+                for (int i = 0; i < TM; ++i) xf[i] = reinterpret_cast<const uint32_t*>(&sXf[(t_row + i) * (KB * BK) + kb0])[q];
+#pragma unroll
+                for (int j = 0; j < TN; ++j) wf[j] = reinterpret_cast<const uint32_t*>(&sWf[(t_col + j) * (KB * BK) + kb0])[q];
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) acc[i][j] = fdot2_f32(xf[i], wf[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gm = m_blk + t_row + i;
+        if (gm < M) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int gn = n_blk + t_col + j;
+                if (gn < N) Y[static_cast<size_t>(gm) * N + gn] = acc[i][j] + (bias ? bias[gn] : 0.0f);
+            }
+        }
+    }
+}
 // FP32 linear Y[M, N] = X[M, K] @ W[N, K]^T + optional bias[N] (used for small projections: router, rel_proj, sink, dyn_sconv)
 template <int MT>
 __global__ void __launch_bounds__(256) k_f32_gemv(
@@ -7074,8 +7276,13 @@ inline void launch_sf4_linear(
         return;
     }
     if (gen == strata::hip_uma::AmdGen::Rdna2 || gen == strata::hip_uma::AmdGen::Unknown) {
-        const dim3 grid((N + 31) / 32, (M + 15) / 16);
-        k_sf4_sdot4_tiled<16, 32><<<grid, 128, 0, st>>>(packed, scales, outer_scale, X, Y, M, N, K);
+        if (M < 48) {
+            const dim3 grid((N + 31) / 32, (M + 31) / 32);
+            k_sf4_sdot4_v2<32, 32, 4><<<grid, 256, 0, st>>>(packed, scales, outer_scale, X, Y, M, N, K);
+        } else {
+            const dim3 grid((N + 63) / 64, (M + 31) / 32);
+            k_sf4_sdot4_v2<32, 64, 4><<<grid, 256, 0, st>>>(packed, scales, outer_scale, X, Y, M, N, K);
+        }
         return;
     }
     if (gen == strata::hip_uma::AmdGen::Rdna4 && use_i8_rdna4) {
@@ -7185,8 +7392,13 @@ inline void launch_bf16_linear(
         return;
     }
     if (gen == strata::hip_uma::AmdGen::Rdna2 || gen == strata::hip_uma::AmdGen::Unknown) {
-        const dim3 grid((N + 31) / 32, (M + 15) / 16);
-        k_bf16_fdot2_tiled<16, 32><<<grid, 128, 0, st>>>(W, X, bias, Y, M, N, K);
+        if (M >= 64) {
+            const dim3 grid((N + 63) / 64, (M + 31) / 32);
+            k_bf16_fdot2_v2<32, 64, 2><<<grid, 256, 0, st>>>(W, X, bias, Y, M, N, K);
+        } else {
+            const dim3 grid((N + 31) / 32, (M + 15) / 16);
+            k_bf16_fdot2_tiled<16, 32><<<grid, 128, 0, st>>>(W, X, bias, Y, M, N, K);
+        }
         return;
     }
     if (M <= 16 || N <= 128) {

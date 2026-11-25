@@ -4074,6 +4074,23 @@ private:
                         kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
                         aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 }
+            } else if (mem_info_.gen == AmdGen::Rdna2 || mem_info_.gen == AmdGen::Unknown) {
+                // RDNA2 (no matrix cores): 4-wave KV-split attention (same design as the B<=8 path)
+                // instead of the sequential-loop generic kernel -- each (qh, m) pair runs 4 waves over KV.
+                if (is_fp8) {
+                    k3_flash_swa_gqa_splitkv<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                } else {
+                    k3_flash_swa_gqa_splitkv<false><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                }
             } else if (is_fp8) {
                 k3_flash_swa_gqa<true><<<dim3((c_.n_head + 3) / 4, B), 128, 0, stream_>>>(
                     q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
@@ -4157,6 +4174,7 @@ private:
                 k4_moe_router_topk<<<B, 128, 0, stream_>>>(rlog, f32_ptr(p + ".mlp.gate.bias"), tk_i, tk_w, B, c_.top_k, c_.route_scale);
             }
 
+            if (B > 4) pmark(6);  // [local] time the whole MoE expert dispatch for prefill chunks
             // MoE Expert Execution:
             // Fast Path A1 (B <= 4, all GPU-resident): 2-launch ZERO-SYNC parallel-expert direct MoE (2,304 blocks!)
             // Fast Path A2 (B >= blaslt_moe_min_b_, all GPU-resident, hipBLASLt ready): L3/MALL-resident unpack-once + hipBLASLt FP16 GEMM!
@@ -4782,6 +4800,7 @@ private:
                 if (!finish_peer_moe_add(B, moeout, err)) return false;
             }
 
+            if (B > 4) pmark(7);
             // Post-MLP ShortConv + residual add (already fused into k_moe_reduce_sconv_add for B<=4 decode!)
             if (!fused_moe_post) {
                 run_sconv(moeout, p + ".mlp_sconv", nullptr, d_sconv_mlp_all_, msc, D, 0, rsl ? &rsl->sconv_rec_mlp : nullptr, visit);
