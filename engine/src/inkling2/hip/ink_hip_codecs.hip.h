@@ -3784,6 +3784,12 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
     __shared__ uint32_t s_sf4_pair[256];     // 1,024 B
     __shared__ float s_sf4_sc[256];          // 1,024 B
     __shared__ float s_gu[8 * 8];            //   256 B ([8 waves][8 tokens])
+    // X-slice staging for the multi-token S2_K/S3_K path: one 256-elem slice of X per super-block,
+    // staged ONCE for the whole workgroup (8 warps = 8 output rows) and double-buffered, so the next
+    // slice's global loads are issued before the current slice is consumed.
+    // Without this, every one of the 2*inter output rows re-reads all of X (L1/L2 traffic ~1 TB/chunk).
+    // Pure data movement: lane->weight mapping and accumulation order are untouched -> bit-identical.
+    __shared__ alignas(16) half_t sXs[2][8][256];  // 8,192 B
 
     const bool single_tok = (m_e == 1);
     const bool use_sx = (single_tok && D <= 2304 && (D & 7) == 0);
@@ -3945,6 +3951,11 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
 #pragma unroll
         for (int t = 0; t < 8; ++t) toks[t] = (t < tm) ? bucket_tok[beg + t0 + t] : 0;
         float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        // Requires: every 256-wide super-block whole in the row, and no warp able to take the
+        // `j >= inter` early return (which would silently skip its share of the staging).
+        const bool stage_x = ((D & 255) == 0) && ((inter & 3) == 0);
+        const int sq = tid >> 5;                 // token index this thread stages
+        const int so = (tid & 31) << 3;          // half-offset of this thread's uint4 inside the slice
 
         if (desc.gu_code == CODE_SF4) {
             const float* hdr = reinterpret_cast<const float*>(desc.body);
@@ -4032,16 +4043,34 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
             const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 70;
             const int j0 = lane * 8;
             const int sub = j0 >> 6;
+            if (stage_x && nsb > 0 && sq < tm) {
+                *reinterpret_cast<uint4*>(&sXs[0][sq][so]) =
+                    *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + so);
+            }
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 70;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, sub);
                 const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, j0);
-                const int k0 = (s << 8) + j0;
-                for (int t = 0; t < tm; ++t) {
-                    const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[t]) * D + k0);
-                    float d = fdot2_f32(wv.x, xv.x, 0.0f);
-                    d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
-                    acc[t] = fmaf(d, eff, acc[t]);
+                if (stage_x) {
+                    __syncthreads();  // slice s is now visible to every warp of the workgroup
+                    if (s + 1 < nsb && sq < tm) {  // prefetch next slice while computing this one
+                        *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][sq][so]) =
+                            *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + ((s + 1) << 8) + so);
+                    }
+                    for (int t = 0; t < tm; ++t) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&sXs[s & 1][t][j0]);
+                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                        acc[t] = fmaf(d, eff, acc[t]);
+                    }
+                } else {
+                    const int k0 = (s << 8) + j0;
+                    for (int t = 0; t < tm; ++t) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[t]) * D + k0);
+                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                        acc[t] = fmaf(d, eff, acc[t]);
+                    }
                 }
             }
         } else if (desc.gu_code == CODE_S3_K) {
@@ -4050,16 +4079,34 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
             const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 102;
             const int j0 = lane * 8;
             const int sub = j0 >> 6;
+            if (stage_x && nsb > 0 && sq < tm) {
+                *reinterpret_cast<uint4*>(&sXs[0][sq][so]) =
+                    *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + so);
+            }
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 102;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, sub);
                 const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, j0);
-                const int k0 = (s << 8) + j0;
-                for (int t = 0; t < tm; ++t) {
-                    const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[t]) * D + k0);
-                    float d = fdot2_f32(wv.x, xv.x, 0.0f);
-                    d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
-                    acc[t] = fmaf(d, eff, acc[t]);
+                if (stage_x) {
+                    __syncthreads();
+                    if (s + 1 < nsb && sq < tm) {
+                        *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][sq][so]) =
+                            *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + ((s + 1) << 8) + so);
+                    }
+                    for (int t = 0; t < tm; ++t) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&sXs[s & 1][t][j0]);
+                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                        acc[t] = fmaf(d, eff, acc[t]);
+                    }
+                } else {
+                    const int k0 = (s << 8) + j0;
+                    for (int t = 0; t < tm; ++t) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[t]) * D + k0);
+                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                        acc[t] = fmaf(d, eff, acc[t]);
+                    }
                 }
             }
         } else {
@@ -4101,6 +4148,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
     }
 }
 
+
 // Fused Grouped MoE Stage 2 (w2) across ALL 128 experts in ONE launch!
 // Wave-7D: uniform m_e==1 LDS-cached fast path + zero-switch S2_K/S3_K 4-subgroup/wave + 1 KB SF4 LUT!
 // Grid: ((D + 7) / 8, 128), Block: 256 (8 waves = 8 output rows; up to 8 tokens/tile in registers!)
@@ -4127,6 +4175,10 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
     __shared__ half_t s_e4m3[256];           //   512 B
     __shared__ uint32_t s_sf4_pair[256];     // 1,024 B
     __shared__ float s_sf4_sc[256];          // 1,024 B
+    // Same L2-traffic kill as k_moe_grouped_w13_situ: every one of the D output rows used to re-read
+    // all of bucket_act for its 8-token tile. Stage one 256-half slice (4 sub-groups = the sg0 step)
+    // per workgroup once, double-buffered with next-slice prefetch. Bit-identical data/order.
+    __shared__ alignas(16) half_t sAs[2][8][256];  // 8,192 B
 
     const bool single_tok = (m_e == 1);
     const bool use_sa = (single_tok && inter <= 1024 && (inter & 7) == 0);
@@ -4292,6 +4344,11 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
     for (int t0 = 0; t0 < m_e; t0 += 8) {
         const int tm = (m_e - t0 < 8) ? (m_e - t0) : 8;
         float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        // Staging needs: act rows 16 B aligned / whole 64-wide sub-groups, and no warp able to take the
+        // `row >= D` early return (that warp would skip its share of the cooperative staging).
+        const bool stage_a = ((inter & 63) == 0) && ((D & 7) == 0);
+        const int sq = tid >> 5;                 // token index this thread stages
+        const int so = (tid & 31) << 3;          // half-offset of this thread's uint4 inside the slice
 
         if (desc.dn_code == CODE_SF4) {
             const float* hdr = reinterpret_cast<const float*>(desc.body);
@@ -4380,20 +4437,54 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
             const uint8_t* pr = W + static_cast<size_t>(pair) * sb_per_pair * 70;
             const int sub_lane = lane >> 3;
             const int l8 = lane & 7;
-            for (int sg0 = 0; sg0 < sub_per_row; sg0 += 4) {
-                const int sg = sg0 + sub_lane;
-                if (sg < sub_per_row) {
-                    const int sub_global = is_odd * sub_per_row + sg;
-                    const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 70;
-                    const int g = sub_global & 3;
-                    const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, g);
-                    const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, (g << 6) + l8 * 8);
-                    const int col0 = (sg << 6) + l8 * 8;
-                    for (int t = 0; t < tm; ++t) {
-                        const uint4 xv = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + t) * inter + col0);
-                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
-                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
-                        acc[t] = fmaf(d, eff, acc[t]);
+            const int nsl = (sub_per_row + 3) >> 2;   // 256-half slices (last one may be partial)
+            if (stage_a) {
+                if (sq < tm && so < inter) {
+                    *reinterpret_cast<uint4*>(&sAs[0][sq][so]) = *reinterpret_cast<const uint4*>(
+                        bucket_act + static_cast<size_t>(beg + t0 + sq) * inter + so);
+                }
+                for (int si = 0; si < nsl; ++si) {
+                    const int sg0 = si << 2;
+                    const int buf = si & 1;
+                    __syncthreads();  // slice si is now visible to every warp of the workgroup
+                    if (si + 1 < nsl && sq < tm) {   // prefetch next slice while computing this one
+                        const int nb = (sg0 + 4) << 6;
+                        if (so < inter - nb) {
+                            *reinterpret_cast<uint4*>(&sAs[buf ^ 1][sq][so]) = *reinterpret_cast<const uint4*>(
+                                bucket_act + static_cast<size_t>(beg + t0 + sq) * inter + nb + so);
+                        }
+                    }
+                    const int sg = sg0 + sub_lane;
+                    if (sg < sub_per_row) {
+                        const int sub_global = is_odd * sub_per_row + sg;
+                        const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 70;
+                        const int g = sub_global & 3;
+                        const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, g);
+                        const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, (g << 6) + l8 * 8);
+                        for (int t = 0; t < tm; ++t) {
+                            const uint4 xv = *reinterpret_cast<const uint4*>(&sAs[buf][t][lane << 3]);
+                            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                            d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                            acc[t] = fmaf(d, eff, acc[t]);
+                        }
+                    }
+                }
+            } else {
+                for (int sg0 = 0; sg0 < sub_per_row; sg0 += 4) {
+                    const int sg = sg0 + sub_lane;
+                    if (sg < sub_per_row) {
+                        const int sub_global = is_odd * sub_per_row + sg;
+                        const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 70;
+                        const int g = sub_global & 3;
+                        const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, g);
+                        const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, (g << 6) + l8 * 8);
+                        const int col0 = (sg << 6) + l8 * 8;
+                        for (int t = 0; t < tm; ++t) {
+                            const uint4 xv = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + t) * inter + col0);
+                            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                            d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                            acc[t] = fmaf(d, eff, acc[t]);
+                        }
                     }
                 }
             }
@@ -4406,20 +4497,54 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
             const uint8_t* pr = W + static_cast<size_t>(pair) * sb_per_pair * 102;
             const int sub_lane = lane >> 3;
             const int l8 = lane & 7;
-            for (int sg0 = 0; sg0 < sub_per_row; sg0 += 4) {
-                const int sg = sg0 + sub_lane;
-                if (sg < sub_per_row) {
-                    const int sub_global = is_odd * sub_per_row + sg;
-                    const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 102;
-                    const int g = sub_global & 3;
-                    const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, g);
-                    const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, (g << 6) + l8 * 8);
-                    const int col0 = (sg << 6) + l8 * 8;
-                    for (int t = 0; t < tm; ++t) {
-                        const uint4 xv = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + t) * inter + col0);
-                        float d = fdot2_f32(wv.x, xv.x, 0.0f);
-                        d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
-                        acc[t] = fmaf(d, eff, acc[t]);
+            const int nsl = (sub_per_row + 3) >> 2;
+            if (stage_a) {
+                if (sq < tm && so < inter) {
+                    *reinterpret_cast<uint4*>(&sAs[0][sq][so]) = *reinterpret_cast<const uint4*>(
+                        bucket_act + static_cast<size_t>(beg + t0 + sq) * inter + so);
+                }
+                for (int si = 0; si < nsl; ++si) {
+                    const int sg0 = si << 2;
+                    const int buf = si & 1;
+                    __syncthreads();
+                    if (si + 1 < nsl && sq < tm) {
+                        const int nb = (sg0 + 4) << 6;
+                        if (so < inter - nb) {
+                            *reinterpret_cast<uint4*>(&sAs[buf ^ 1][sq][so]) = *reinterpret_cast<const uint4*>(
+                                bucket_act + static_cast<size_t>(beg + t0 + sq) * inter + nb + so);
+                        }
+                    }
+                    const int sg = sg0 + sub_lane;
+                    if (sg < sub_per_row) {
+                        const int sub_global = is_odd * sub_per_row + sg;
+                        const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 102;
+                        const int g = sub_global & 3;
+                        const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, g);
+                        const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, (g << 6) + l8 * 8);
+                        for (int t = 0; t < tm; ++t) {
+                            const uint4 xv = *reinterpret_cast<const uint4*>(&sAs[buf][t][lane << 3]);
+                            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                            d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                            acc[t] = fmaf(d, eff, acc[t]);
+                        }
+                    }
+                }
+            } else {
+                for (int sg0 = 0; sg0 < sub_per_row; sg0 += 4) {
+                    const int sg = sg0 + sub_lane;
+                    if (sg < sub_per_row) {
+                        const int sub_global = is_odd * sub_per_row + sg;
+                        const uint8_t* blk = pr + static_cast<size_t>(sub_global >> 2) * 102;
+                        const int g = sub_global & 3;
+                        const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, g);
+                        const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, (g << 6) + l8 * 8);
+                        const int col0 = (sg << 6) + l8 * 8;
+                        for (int t = 0; t < tm; ++t) {
+                            const uint4 xv = *reinterpret_cast<const uint4*>(bucket_act + static_cast<size_t>(beg + t0 + t) * inter + col0);
+                            float d = fdot2_f32(wv.x, xv.x, 0.0f);
+                            d = fdot2_f32(wv.y, xv.y, d); d = fdot2_f32(wv.z, xv.z, d); d = fdot2_f32(wv.w, xv.w, d);
+                            acc[t] = fmaf(d, eff, acc[t]);
+                        }
                     }
                 }
             }
@@ -4456,6 +4581,7 @@ __global__ void __launch_bounds__(256) k_moe_grouped_w2(
             const float sum = wave32_sum(acc[t]);
             if (lane == 0) bucket_y[static_cast<size_t>(beg + t0 + t) * D + row] = sum;
         }
+        if (stage_a) __syncthreads();  // every warp must be done reading before the next tile reuses the buffers
     }
 }
 
