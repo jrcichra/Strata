@@ -3758,7 +3758,7 @@ __global__ void __launch_bounds__(128) k_moe_build_buckets(
 // Fused Grouped MoE Stage 1 (w13 + SITU) across ALL 128 experts in ONE launch!
 // Reads each active expert's weights ONCE for all m_e tokens routed to it (processes up to 8 tokens/tile in registers!).
 // Grid: ((inter + 3) / 4, 128), Block: 256 (8 waves = 4 (gate, up) pairs; uses LDS s_e4m3 LUT for MX8!)
-__global__ void __launch_bounds__(256) k_moe_grouped_w13_situ(
+__global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
     const GpuExpertDesc* __restrict__ exps,  // [128]
     const int32_t* __restrict__ exp_off,     // [129]
     const int32_t* __restrict__ bucket_tok,  // [B * top_k]
