@@ -1500,7 +1500,27 @@ public:
                     || (post_tot <= (17ULL << 30) && post_free < (4096ULL << 20))
 #endif
                     ;
-                if (tight_vram) {
+                // Explicit override for prefill-heavy runs: STRATA_MAX_PREFILL_CHUNK trades long-context
+                // decode throughput for faster prefill by letting a chunk stream the expert weights once for
+                // more tokens. Measured on gfx1031 (RX 6700 XT, 12 GiB, 982 MiB free after load, kv fp8):
+                //   chunk 512 vs 256 -> prefill +5.6% at 2048 tokens, +4.9% at 8192, decode unchanged at
+                //   2048, but decode -10% at 8192-token context. Logits are bit-identical either way
+                //   (--kld-eval on a 512-token prompt: Mean KLD=0.000000, Top-1=100.00%, 511 positions).
+                // Unset env keeps the previous heuristic-derived behaviour exactly.
+                int user_chunk = 0;
+                if (const char* ov = std::getenv("STRATA_MAX_PREFILL_CHUNK")) {
+                    const int v = std::atoi(ov);
+                    if (v >= 64 && v <= 4096) user_chunk = v;
+                }
+                if (user_chunk > 0) {
+                    if (guard_.max_prefill_chunk != user_chunk) {
+                        guard_.max_prefill_chunk = user_chunk;
+                        std::fprintf(stderr,
+                                     "[ink-hip] max_prefill_chunk=%d from STRATA_MAX_PREFILL_CHUNK (post-load free=%.0f MiB; "
+                                     "faster prefill, slower long-context decode)\n",
+                                     user_chunk, post_free / 1048576.0);
+                    }
+                } else if (tight_vram) {
                     const int tight_chunk = (post_free < (1536ULL << 20)) ? 256 : 512;
                     if (guard_.max_prefill_chunk > tight_chunk) {
                         guard_.max_prefill_chunk = tight_chunk;
