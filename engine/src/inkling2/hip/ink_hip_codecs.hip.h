@@ -4152,7 +4152,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
 // Fused Grouped MoE Stage 2 (w2) across ALL 128 experts in ONE launch!
 // Wave-7D: uniform m_e==1 LDS-cached fast path + zero-switch S2_K/S3_K 4-subgroup/wave + 1 KB SF4 LUT!
 // Grid: ((D + 7) / 8, 128), Block: 256 (8 waves = 8 output rows; up to 8 tokens/tile in registers!)
-__global__ void __launch_bounds__(256) k_moe_grouped_w2(
+__global__ void __launch_bounds__(256, 8) k_moe_grouped_w2(
     const GpuExpertDesc* __restrict__ exps,  // [128]
     const int32_t* __restrict__ exp_off,     // [129]
     const half_t* __restrict__ bucket_act,   // [B * top_k, inter]
