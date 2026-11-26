@@ -131,3 +131,14 @@ These candidates are reverted. Larger shared staging did not help, suggesting th
 ## Upstream version check
 
 The checked-out source is `v0.2.21.1` plus the RDNA2 tuning branch; `strata-inkling` reports engine version 0.1.67. Upstream `v0.2.22` is newer, but its release notes explicitly keep AMD/Intel/Apple Inkling at 0.1.67 because those engines did not change. The upstream changes to Inkling engine paths since our base are the engine version bump/build-symbol work and a CUDA peer-card fix; no newer HIP kernel change was found. The 0.2.21 release lists an 8.5 GiB VRAM expert budget workaround for RX 6700 XT-class cards; testing that budget here did not improve the measured rates. See [0.2.21](https://github.com/Niko1221/Strata/releases/tag/v0.2.21) and [0.2.22](https://github.com/Niko1221/Strata/releases/tag/v0.2.22).
+
+### W/O fused GEMV row geometry (2026-11-26)
+
+The batch-one W/O projection kernel maps one wave to each output row and stages the activation vector in LDS once per block. I compared the existing 256-thread / 8-row CTA with a temporary 128-thread / 4-row CTA. The LDS copy loop was made block-size-aware so the smaller CTA still covers all activation elements. Per-row arithmetic and accumulation order were unchanged.
+
+| Geometry | 2K prompt / 256 generated, two warmed runs | Decision |
+|---|---|---|
+| 256 threads / 8 rows (control) | 53.7, 54.0 decode tok/s; 189.9, 190.0 prefill tok/s | Keep |
+| 128 threads / 4 rows | 50.1, 50.3 decode tok/s; 189.5, 189.9 prefill tok/s | Reject; about 6.7% slower decode |
+
+The experiment and its block-size-aware LDS copy are reverted. More blocks did not compensate for the smaller CTA on this GPU.
