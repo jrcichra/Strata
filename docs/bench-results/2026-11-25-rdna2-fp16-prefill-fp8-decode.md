@@ -155,3 +155,14 @@ A temporary 512-thread variant doubled each grouped W13 CTA from 8 to 16 output 
 | 512 threads / 16 rows | 189.8, 190.1 prefill; 53.6, 53.8 decode tok/s | Reject; no measurable improvement |
 
 The large-CTA specialization and dispatch were reverted. The unchanged throughput suggests CTA count and repeated activation staging are not the dominant limiter at this chunk size; weight decode/compute remains the more likely W13 cost.
+
+### Grouped W13 token-loop unroll (2026-11-26)
+
+Added a temporary two-way unroll to the S2_K/S3_K multi-token inner loops. Each token kept its existing four-`fdot2` and SITU accumulation order; the trial only changed scheduling and loop control.
+
+| Variant | 2K prompt / 256 generated, two warmed runs | Decision |
+|---|---|---|
+| Existing dynamic token loops | 189.8–190.1 prefill; 53.6–53.8 decode tok/s | Keep |
+| Two-way unroll for S2_K/S3_K | 189.5, 189.6 prefill; 53.4, 53.8 decode tok/s | Reject; no gain |
+
+The unroll was reverted. Token-loop control was not a meaningful limiter for this kernel on the tested workload.
