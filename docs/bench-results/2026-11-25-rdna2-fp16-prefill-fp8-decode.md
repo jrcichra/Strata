@@ -144,3 +144,14 @@ The batch-one W/O projection kernel maps one wave to each output row and stages 
 The experiment and its block-size-aware LDS copy are reverted. More blocks did not compensate for the smaller CTA on this GPU.
 
 A second W/O geometry trial used 512 threads / 16 rows per CTA. The two warmed decode runs were 55.3 and 52.6 tok/s (mean 53.95), against 53.7 and 54.0 tok/s for the 256-thread control (mean 53.85). The spread is larger than the mean difference, so there is no repeatable gain; the 512-thread change was reverted. The established 256-thread / 8-row geometry remains the production setting.
+
+### Grouped W13 16-row output CTA trial (2026-11-26)
+
+A temporary 512-thread variant doubled each grouped W13 CTA from 8 to 16 output rows while keeping the expert/token tile at 16. It halves the W13 grid width and lets one CTA reuse staged X across twice as many output rows. The block-size-dependent LDS copy stride and 256-entry lookup-table initialization were adjusted for 512 threads; dispatch used this variant only for batches of at least 128 tokens.
+
+| Geometry | 2K prompt / 256 generated, two warmed runs | Decision |
+|---|---|---|
+| 256 threads / 8 rows (control) | 189.9–190.0 prefill; 53.7–54.0 decode tok/s | Keep |
+| 512 threads / 16 rows | 189.8, 190.1 prefill; 53.6, 53.8 decode tok/s | Reject; no measurable improvement |
+
+The large-CTA specialization and dispatch were reverted. The unchanged throughput suggests CTA count and repeated activation staging are not the dominant limiter at this chunk size; weight decode/compute remains the more likely W13 cost.
