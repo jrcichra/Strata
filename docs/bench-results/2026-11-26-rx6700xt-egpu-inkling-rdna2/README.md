@@ -7,7 +7,8 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
   96 MB Infinity Cache. RDNA2: **no matrix cores** (zero WMMA intrinsics on gfx103x), `fdot2` available, no hipBLASLt.
   Thunderbolt 3 Gen3 x4 host link, measured ~3.9 GB/s raw — relevant because any expert placed in system RAM is slow.
 - **Model:** Inkling-2-Mini-SQ-10, 26.4 B total / 3.4 B active (5.4 B looped-active across 48 virtual visits),
-  `CODE_SF4` expert weights (4-bit e2m1 + e4m3 block scales), all experts in VRAM.
+  expert weights in VRAM. Measured directory mix (24 layers x 128 experts): 585 S2_K, 2,472 S3_K, and
+  15 SF4 (4-bit e2m1 + e4m3 block scales); the older description of this model as all SF4 was stale.
 - **Branch:** `rdna2-moe-lds-staging`. **Binary under test:** `2460e04a3`, md5 `50ac62ae467218043def9c32a3d2bd5e`;
   the clean baseline `a0e388d` was md5 `cd3bc440dff82c9962c682eccf9faecd`. ROCm libs come from the stock
   `0.1.67-linux-x86_64-hip-rx6000` component package (the `enginetest` dir used throughout is only symlinks to it).
