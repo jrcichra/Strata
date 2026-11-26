@@ -527,6 +527,31 @@ __device__ __forceinline__ uint32_t ld_u32_unaligned(const uint8_t* p) {
     return v;
 }
 
+// S2/S3 pair LUT decoder for grouped W13. The LUT stores two unscaled weights as FP16x2.
+__device__ __forceinline__ uint4 decode_sk_8_unscaled_f16_lut(
+    const uint8_t* pl, int code, int j0, const uint32_t* pair_lut) {
+    uint32_t w2[4];
+    if (code == CODE_S2_K) {
+        const uint16_t raw = ld_u16_unaligned(pl + (j0 >> 2));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q0 = (raw >> (4 * i)) & 3u;
+            const uint32_t q1 = (raw >> (4 * i + 2)) & 3u;
+            w2[i] = pair_lut[q0 | (q1 << 2)];
+        }
+    } else {
+        const uint16_t lo = ld_u16_unaligned(pl + (j0 >> 2));
+        const uint8_t hi = pl[64 + (j0 >> 3)];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q0 = ((lo >> (4 * i)) & 3u) | (((hi >> (2 * i)) & 1u) << 2);
+            const uint32_t q1 = ((lo >> (4 * i + 2)) & 3u) | (((hi >> (2 * i + 1)) & 1u) << 2);
+            w2[i] = pair_lut[q0 | (q1 << 3)];
+        }
+    }
+    return make_uint4(w2[0], w2[1], w2[2], w2[3]);
+}
+
 // Fast 8-weight aligned S_K unpack to 4 packed FP16x2 words (unscaled integer values in [-128..127]):
 // Switches ONCE per 8 weights and uses 32-bit loads (eliminates 8x runtime switch + 8x byte loads!)
 __device__ __forceinline__ uint4 decode_sk_8_unscaled_f16(const uint8_t* pl, int code, int j0) {
@@ -3784,7 +3809,8 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
     __shared__ half_t s_e4m3[256];           //   512 B
     __shared__ uint32_t s_sf4_pair[256];     // 1,024 B
     __shared__ float s_sf4_sc[256];          // 1,024 B
-    __shared__ float s_gu[8 * kTileM];  // 8 waves x kTileM tokens
+    __shared__ float s_gu[8 * kTileM];       // 8 waves x kTileM tokens
+    __shared__ uint32_t s_sk_pair_lut[64];  // S2_K/S3_K quantized weight pairs -> FP16x2
     // X-slice staging for the multi-token S2_K/S3_K path: one 256-elem slice of X per super-block,
     // staged ONCE for the whole workgroup (8 warps = 8 output rows) and double-buffered, so the next
     // slice's global loads are issued before the current slice is consumed.
@@ -3807,6 +3833,13 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
         const hv2 hp = {sf4_e2m1_f16(static_cast<uint32_t>(tid) & 15u), sf4_e2m1_f16(static_cast<uint32_t>(tid) >> 4)};
         s_sf4_pair[tid] = __builtin_bit_cast(uint32_t, hp);
         s_sf4_sc[tid] = e4m3fn_to_f32(static_cast<uint8_t>(tid));
+    } else if ((desc.gu_code == CODE_S2_K || desc.gu_code == CODE_S3_K) && tid < 64) {
+        const uint32_t q0 = (desc.gu_code == CODE_S2_K) ? (static_cast<uint32_t>(tid) & 3u) : (static_cast<uint32_t>(tid) & 7u);
+        const uint32_t q1 = (desc.gu_code == CODE_S2_K) ? ((static_cast<uint32_t>(tid) >> 2) & 3u) : ((static_cast<uint32_t>(tid) >> 3) & 7u);
+        const int bias = (desc.gu_code == CODE_S2_K) ? 3 : 7;
+        const int mul = 2;
+        const hv2 hp = {static_cast<half_t>(static_cast<int>(q0 * mul) - bias), static_cast<half_t>(static_cast<int>(q1 * mul) - bias)};
+        s_sk_pair_lut[tid] = __builtin_bit_cast(uint32_t, hp);
     }
     __syncthreads();
     if (j >= inter) return;
@@ -3890,7 +3923,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 70;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, sub);
                 const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (s << 8) + j0);
-                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, j0);
+                const uint4 wv = decode_sk_8_unscaled_f16_lut(blk + 6, CODE_S2_K, j0, s_sk_pair_lut);
                 float d = fdot2_f32(wv.x, xv.x, 0.0f);
                 d = fdot2_f32(wv.y, xv.y, d);
                 d = fdot2_f32(wv.z, xv.z, d);
@@ -3907,7 +3940,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 102;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, sub);
                 const uint4 xv = *reinterpret_cast<const uint4*>(xsrc + (s << 8) + j0);
-                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, j0);
+                const uint4 wv = decode_sk_8_unscaled_f16_lut(blk + 6, CODE_S3_K, j0, s_sk_pair_lut);
                 float d = fdot2_f32(wv.x, xv.x, 0.0f);
                 d = fdot2_f32(wv.y, xv.y, d);
                 d = fdot2_f32(wv.z, xv.z, d);
@@ -4053,7 +4086,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 70;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S2_K, sub);
-                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, j0);
+                const uint4 wv = decode_sk_8_unscaled_f16_lut(blk + 6, CODE_S2_K, j0, s_sk_pair_lut);
                 if (stage_x) {
                     __syncthreads();  // slice s is now visible to every warp of the workgroup
                     if (s + 1 < nsb) {  // prefetch each staged token's next slice while computing this one
@@ -4093,7 +4126,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 102;
                 const float eff = decode_sk_sub_eff_i8(blk, CODE_S3_K, sub);
-                const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, j0);
+                const uint4 wv = decode_sk_8_unscaled_f16_lut(blk + 6, CODE_S3_K, j0, s_sk_pair_lut);
                 if (stage_x) {
                     __syncthreads();
                     if (s + 1 < nsb) {

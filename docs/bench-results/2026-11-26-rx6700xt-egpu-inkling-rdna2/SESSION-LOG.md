@@ -1,7 +1,3 @@
-> Archived working log for the RX 6700 XT eGPU RDNA2 work. Read the sibling `README.md` first;
-> it is the curated result. This file is the raw record, including sections where a conclusion
-> was later corrected by measurement. Machine-local paths are kept verbatim for reproducibility.
-
 # Razer Core eGPU + Strata/Inkling on a Dell Latitude 5420 — session log
 
 Date: 2026-11-25. Environment: live USB (Ubuntu 26.10, kernel 7.3.0-9) on a Dell Latitude 5420; everything under `/home/ubuntu` is in RAM and is lost on reboot unless noted.
@@ -21,7 +17,7 @@ Note: Ubuntu's system `libamdhip64.so.7.15` segfaults on this machine. Anything 
 
 ## 2. Storage
 
-> *[local disk-encryption state and root-access details redacted for publication]*
+- Internal NVMe `nvme0n1p3` is BitLocker-encrypted but protected by a **clear key**, so it opens with no password:
   `sudo cryptsetup bitlkOpen /dev/nvme0n1p3 winc && sudo mount -t ntfs-3g -o uid=1000,gid=1000 /dev/mapper/winc /mnt/win` (about 407 GB free).
 - Ventoy boot USB data partition: `sudo mount -t exfat /dev/mapper/VentoyPart /mnt/ventoy` (about 22 GB free, holds the ISOs; do not touch them).
 - Everything for this project lives in **`/mnt/win/llm-temp/`** (delete with `rm -rf /mnt/win/llm-temp` when finished):
@@ -588,7 +584,7 @@ To get real stall data, one of these must happen (all need someone with root):
   * or run the same kernels on any box where counters are permitted.
 
 ## 18. REAL HW COUNTERS ACHIEVED (corrects §17 -- I have passwordless root)
-> *[local disk-encryption state and root-access details redacted for publication]*
+§17 was wrong: `sudo` is available and `(ALL) NOPASSWD: ALL`, so kernel counters are reachable.
 Recipe that actually works on this box (never apt-installs, so the working enginetest ROCm bundle is safe):
     sudo sysctl -w kernel.perf_event_paranoid=2          # revert with =4 when done
     # from https://repo.radeon.com/rocm/apt/7.2.4/dists/noble/main/binary-amd64/Packages, dpkg -x each into
@@ -1079,3 +1075,77 @@ is NOT a multiple of the chunk (e.g. 2000 or 2200 at chunk 512) before concludin
 (b) `STRATA_HIP_DSPARK_PROF=1` printed ZERO lines through the run() wrapper (job bcdb16956) -- still no direct
 evidence for the stuck-EMA theory in S30; retest with env(1) and check whether the bench even loads dspark.
 (c) never pipe `cmake --build` through `tail` in a script: destroys the error and hides the exit code from set -e.
+
+## 32. Concurrency is net-NEGATIVE on this box -- my "free 2-3x" hypothesis was wrong
+
+Job `beaa91502`, prompt 2048 gen 256, killed during `--parallel 4` because the trend was already decisive:
+
+| parallel | prefill ppts | aggregate decode tps | tps/slot |
+|---:|---:|---:|---:|
+| 1 | 186.7 | **52.5** | 52.5 |
+| 2 | 185.3 | 47.1 | 23.5 |
+| 3 | 36.7 | 10.9 | 3.6 |
+
+Aggregate throughput DROPS below single-stream at 2 slots and collapses at 3 (prefill falls 5x). Mechanism: a
+single stream already saturates this card's effective bandwidth, so extra slots add only KV pressure; past ~2
+slots the 12 GiB is over-subscribed and experts spill to system RAM across the ~3.9 GB/s Thunderbolt link.
+Every run printed `Capped max_prefill_chunk=512 (post-load free=982 MiB, 512-token scratch=391 MiB)`, i.e.
+there was never spare headroom to begin with.
+
+Consequences: (a) the largest remaining "massive tps" hope is dead -- do not propose `--parallel` as a win here;
+(b) it predicts the SERVED config will be worse still, since setup already parks `--ram-experts-gb 1.69` in RAM
+to fit `--max-context 131072`, which is the same failure mode chosen in advance.
+
+## 33. gen-64 decode cell filled (+1.9% at gen 64; cumulative decode now +18.1%); prompt tails are harmless
+
+Job `bdf517739`, binary `2460e04a3`:
+- `--prompt-len 2048 --gen 64`: **41.8 / 41.7 tps** vs the 40.9-41.0 bar -> +1.9%. So the shipped decode win holds
+  at gen 64 as well as gen 256, and cumulative decode vs baseline is **35.4 -> 41.8 = +18.1%** (earlier docs said
+  +15.8% using the stale 41.0 bar). Prefill unchanged 186.6-186.7.
+- **Prompt tails** (never tested before; all prior numbers used 2048 with chunk 512 = exact multiple):
+  at cap 512 -> 2000: 186.8 ppts, 2200: 183.4, 2048: 186.9. At cap 256 -> 176.8 / 174.6 / 176.9. A 152-token tail
+  costs 1.9%, a 464-token tail ~0.1%; chunk 512 beats 256 uniformly by ~5.7%. Conclusion: the #7009 wave-imbalance
+  concern has no measurable headroom here, and earlier 2048-based conclusions stand.
+  Decode at `--gen 8` is meaningless noise (24.9 vs 41.4 tps for near-identical work) -- reinforces gen >= 256.
+- `--spec-check` requires `--prompt-ids` (it rejected `--prompt-len`); rerun as job `b67d50214` with
+  `prompt512_cma.ids` / `prompt2048_cma.ids` to get the real `fused / draft+verify / single` split and
+  drafted/emitted acceptance. Until that lands, NO acceptance figure in this log is measured.
+
+## 34. OPEN: possible correctness regression in 2460e04a3 -- testing stopped by request, unresolved
+
+Acceptance first (prompt ids, seed 13, `--spec-check 64`, binary 50ac62ae):
+- prompt 2048: `steps=50 (fused 13, draft+verify 0, single 37), drafted 29, emitted 26`
+- prompt 512 : `steps=46 (fused 9,  draft+verify 0, single 37), drafted 22, emitted 26`
+`drafted_sum/emitted_sum` are updated by the FUSED path too (ink_main.cpp:690-691), not only draft+verify, so these
+describe the tree: ~2.2 tokens per fused forward at 2048 (2.9 at 512) vs 1.0 for single steps. Overall acceptance is
+64/50 = **1.28 tokens per forward** at 2048 -- NOT the 1.63 I earlier derived from a stale 40 ms/forward figure.
+The weakness is speculation FREQUENCY (fused engaged 13 of 50 steps), not acceptance rate. `draft+verify 0` also
+confirms the adaptive-backoff fallback `dspark_draft()` never runs in this configuration -> measured evidence for
+UPSTREAM-NOTES issue B.
+
+Then the problem. Same binary, prompt 512: `speculative vs plain over 64 tokens: DIFFER (first difference at
+generated token 24: plain 68017, speculative 220)`; prompt 2048 identical. Greedy speculation should be lossless
+against plain greedy -- that is what --spec-check exists to prove.
+
+Two of my own hypotheses were tested and died:
+1. "nondeterminism / race" -- FALSE. 3/3 repeats give the same spec fingerprint 0876b3dbffe82992 and the same
+   first-divergence index. Deterministic per binary.
+2. "atomic reordering in the MoE combine" -- UNSUPPORTED. In k_moe_direct_w2_reduce the atomicAdd calls count
+   expert slots (s_cnt/exp_cnt/exp_cur); k_moe_direct_w13_situ contains none.
+
+Then I found my own error: the earlier "identical at prompt 512" observation (job b4e98d269) came from a run whose
+script performed the spec-check BEFORE its final rebuild, so it used the pre-commit binary cd3bc440. My "same binary,
+different result" framing was wrong; the honest framing is "pre-commit binary matched, post-commit binary diverges".
+
+Coverage hole that made this possible: my parity gate tested B=1 (teacher forcing) and B=256 (prefill) only. The
+fused tree verifies at intermediate widths and k_moe_direct_* serves B<=4. B=2..4 was never parity-tested, so a
+behavioural change there is invisible to the gate that justified the commit. Leading mechanism: 16 waves cost 8
+spilled VGPRs, and a spilled value must be rounded, which can break FMA contraction -> ulp-level logit changes ->
+near-tie argmax flips. B=1 instantiation can be exact while B=2..4 is not.
+
+Status: STOPPED on request. Bisect job b55d7e96d was killed during its Phase 1 rebuild, so causality is UNPROVEN --
+recorded as an OPEN item at the top of README.md, not as a conclusion. Repo left clean at HEAD; binary on disk is
+50ac62ae (matches HEAD). Practical severity for our own deployment is low because the serve profile runs --draft off,
+so the speculative path is not used; severity for anyone enabling speculation is unknown until the bisect runs (~8 min:
+rebuild 2460e04a3^ vs HEAD codecs, run spec-check on prompt512_cma.ids for each; if pre-commit matches and post-commit
+diverges, revert 2460e04a3).

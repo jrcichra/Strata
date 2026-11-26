@@ -214,24 +214,16 @@ __device__ __forceinline__ float sf4_e2m1_f32(uint32_t nib) {
 
 // ---- Exact F8_E4M3FN & UE8M0 decoders (for SF4 block scales, MX8 weights/scales, and FP8 KV cache) ----
 __device__ __forceinline__ float e4m3fn_to_f32(uint8_t b) {
+    // Branchless decode of E4M3FN: exp==0 means mant*2^-9, exp==15/mant==7 is NaN -> 0.
+    // Verified bit-identical to the original branchy implementation for all 256 byte values.
     const uint32_t sign = static_cast<uint32_t>(b & 0x80u) << 24;
     const uint32_t exp  = (b >> 3) & 0x0Fu;
     const uint32_t mant = b & 0x07u;
-    uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign;
-        } else {
-            // Subnormal: mant * 2^-9
-            const float val = static_cast<float>(mant) * (1.0f / 512.0f);
-            return (b & 0x80u) ? -val : val;
-        }
-    } else if (exp == 15 && mant == 7) {
-        return 0.0f;  // NaN maps to 0.0f safely
-    } else {
-        f = sign | ((exp + (127u - 7u)) << 23) | (mant << 20);
-    }
-    return __builtin_bit_cast(float, f);
+    float f = __builtin_bit_cast(float, sign | ((exp + 120u) << 23) | (mant << 20));
+    const float sub = static_cast<float>(mant) * (1.0f / 512.0f);
+    f = (exp == 0u) ? ((b & 0x80u) ? -sub : sub) : f;
+    f = (exp == 15u && mant == 7u) ? 0.0f : f;
+    return f;
 }
 
 __device__ __forceinline__ uint8_t f32_to_e4m3fn(float x) {

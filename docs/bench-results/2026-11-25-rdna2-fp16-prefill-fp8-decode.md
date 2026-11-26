@@ -178,3 +178,39 @@ The repository already has per-64 activation Q8 quantization for newer WMMA path
 | Q8 + sdot4, shared Xq staging | 166.4, 167.0 prefill; 53.3, 53.6 decode tok/s | Reject |
 
 Both experimental kernels and dispatch were reverted. Neither was fast enough to justify measuring its approximate activation quantization quality. The integer-dot idea is not promising in this scalar mapping; weight unpack and per-subgroup scale work likely outweighed the cheaper dot instruction (inference from the timing and source structure).
+
+### Bit-identical decode fast paths (2026-11-26)
+
+Two kernel-level changes landed on top of the 189.8 / 53.8 tok/s control above. Both produce exactly the
+same numeric values as the code they replaced; no approximate math or sampling change is involved.
+
+A `STRATA_HIP_PROF=2` profile at B=512 located the first change. The attention stage over the four
+512-token chunks cost 2,295 ms with FP8 KV but 1,075 ms with FP16 KV on the same build. The FP8 path
+decodes every E4M3 byte with `e4m3fn_to_f32`, which used early returns for subnormals and NaN; those
+branches diverge across a wave inside the inner attention loop. The helper is now branchless: the
+normal bit pattern is formed unconditionally, then subnormal and NaN results are selected. An exhaustive
+host-side check over all 256 byte values confirmed bit-identical floats, including signed zero.
+
+The second change is a 64-entry shared lookup table for the S2_K/S3_K weight pairs in the grouped W13
+kernel. It replaces repeated integer-to-half conversions while keeping the same FP16 values, the same
+`fdot2` accumulation order, and the same SITU epilogue. The 2K/256 control and both candidate stages:
+
+| Build | 2K prompt / 256 generated, three warmed runs | Decision |
+|---|---|---|
+| Control (before both changes) | 189.7, 189.8, 189.8 prefill; 53.5, 53.8, 53.9 decode tok/s | Baseline |
+| Pair lookup table only | 189.9, 190.4, 190.6 prefill; 53.5, 53.9, 54.0 decode tok/s | Keep; about 0.3% |
+| Pair table + branchless E4M3 decode | 195.6, 196.3, 196.5 prefill; 55.0, 55.4, 55.3 decode tok/s | Keep; about 3.4% prefill, 2.8% decode |
+
+The final row was rerun on the exact committed source after removing the temporary diagnostic build:
+`--selfcheck` passes, and the three-run bench is reproduced above. The gain is reproducible across
+runs with a spread of about 0.9 tok/s on prefill and 0.4 tok/s on decode. No quality check was run
+because both transforms are bit-exact by construction; the E4M3 mapping was checked exhaustively and
+the pair table uses the same `2*q-3` / `2*q-7` mapping as the original unpack.
+
+The model directories contain 585 S2_K, 2,472 S3_K, and 15 SF4 gate/up expert matrices (24 layers x
+128 experts), so the pair table covers 99.5% of the W13 weights. The remaining SF4 matrices already
+use their own shared lookup table.
+
+The separate FP16-prefill-to-FP8-decode benchmark hook is still available for short contexts. With the
+faster FP8 attention path its advantage is now smaller than the 11.5% measured earlier, and it still
+needs two copies of the KV pages during conversion, so it remains a benchmark-only option.
