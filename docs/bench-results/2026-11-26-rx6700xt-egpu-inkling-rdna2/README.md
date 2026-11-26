@@ -19,7 +19,7 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
 |---|---:|---:|---:|
 | prefill | 117.1 ppts | 186.7–187.0 ppts | **+59.5%** |
 | time to first token (2048 tok) | 17.49 s | 10.96 s | −37.3% |
-| decode | 35.4 tps | 40.9–41.0 tps | **+15.8%** |
+| decode | 35.4 tps | 41.7–41.8 tps | **+18.1%** |
 
 Per commit, prefill ppts (prompt 2048):
 
@@ -36,6 +36,7 @@ Per commit, prefill ppts (prompt 2048):
 
 | window | bar (`a0e388d`) | after `2460e04a3` | Δ |
 |---|---:|---:|---:|
+| 2048 × gen 64 | 40.9–41.0 tps | 41.8 / 41.7 | +1.9% |
 | 2048 × gen 256 | 51.0 tps | 52.6 / 52.4 / 52.3 | +2.7% |
 | 8192 × gen 512 | 46.9 tps | 48.0 / 47.9 | +2.2% |
 | 512 × gen 256 | 25.8 tps | 26.6 | +3.1% |
@@ -110,6 +111,22 @@ One stream already saturates the card's effective bandwidth, so additional slots
 past ~2 slots the 12 GiB budget is over-subscribed and experts spill into system RAM across the ~3.9 GB/s
 Thunderbolt link. Every run logged `Capped max_prefill_chunk=512 (post-load free=982 MiB, 512-token scratch=391 MiB)`,
 i.e. there was no headroom to begin with. **Do not treat `--parallel` as a throughput lever on this machine.**
+
+### Prompt tails are cheap -- the evenly-divided benchmark was not hiding anything
+
+Every prefill number in this document used prompt 2048 with chunk 512, i.e. `2048 % 512 == 0`, so no partial
+chunk was ever executed. Measured now with `--gen 8` (prefill only; the decode column at gen 8 is noise):
+
+| prompt | chunks at cap 512 | prefill ppts | prefill ppts at cap 256 |
+|---|---|---:|---:|
+| 2000 | 512+512+512+464 | 186.8 | 176.8 |
+| 2200 | 512+512+512+152 | 183.4 | 174.6 |
+| 2048 | exact multiple | 186.9 | 176.9 |
+
+A 152-token tail costs 1.9% and a 464-token tail costs ~0.1%, and chunk 512 beats 256 on every prompt by
+about 5.7%. So the tail-chunk retiling idea borrowed from #7009 has no measurable headroom to recover on
+this card, and the earlier conclusions drawn from 2048 stand. (Incidentally the decode cells here -- 24.9 vs
+41.4 tps for near-identical work -- are a live demonstration of why decode must be measured at gen >= 256.)
 
 ## Not shipped, and why
 
