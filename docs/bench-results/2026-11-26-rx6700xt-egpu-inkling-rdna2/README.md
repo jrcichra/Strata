@@ -13,6 +13,47 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
   `0.1.67-linux-x86_64-hip-rx6000` component package (the `enginetest` dir used throughout is only symlinks to it).
 - **Dates:** 2026-11-25 → 2026-11-26.
 
+## OPEN -- possible correctness regression in `2460e04a3`; do not treat its "bit-identical" label as settled
+
+`2460e04a3` is a one-line change, `__launch_bounds__(256)` -> `(256, 16)` on `k_moe_direct_w13_situ`, and its commit
+message says "bit-identical". That claim was established only at **B=1** (teacher-forced `--dump-ref` parity,
+KLD=0.000000, Top-1 100%) and at B=256 (prefill). The **B=2..4** instantiations of the same kernel were never
+parity-tested -- and B<=4 is exactly the band the fused speculative tree verifies in.
+
+Observed with the committed binary (`50ac62ae...`, seed 13, `--spec-check 64`):
+
+```
+prompt 512  : speculative vs plain greedy DIFFER (first difference at generated token 24: plain 68017, speculative 220)
+              reproduced 3/3 with identical speculative fingerprint 0876b3dbffe82992  -> deterministic, not a race
+prompt 2048 : speculative vs plain greedy identical (3/3)
+```
+
+Greedy speculative decoding is supposed to be *lossless* against plain greedy; that is the entire purpose of
+`--spec-check`. The earlier `identical` result at prompt 512 came from job `b4e98d269`, whose spec-check ran
+**before** that job's rebuild and therefore used the pre-commit binary `cd3bc440`. So: pre-commit binary matched,
+post-commit binary does not, same prompt and seed.
+
+**Causality is not established.** The bisect (job `b55d7e96d`) was stopped on request during its Phase 1 rebuild.
+Two hypotheses were tested and rejected first: a data race (deterministic across repeats) and atomic reordering in
+the MoE combine (the direct decode kernels use atomics only for expert *slot counting*; `k_moe_direct_w13_situ`
+uses none).
+
+Leading candidate mechanism: reaching 16 waves cost 8 spilled VGPRs, and a value forced through memory must be
+rounded, which can split a fused multiply-add. That perturbs low bits of logits -- enough to flip a near-tie
+argmax. Register pressure differs per batch-width instantiation, so B=1 can stay exact while B=2..4 shifts.
+
+**Severity for the deployment templated in `deploy/`: low** -- that profile runs `--draft off`, so the speculative
+path is never taken. Severity for anyone who enables speculation: potentially high.
+
+To settle it (GPU, ~8 min): build `2460e04a3^` codecs (expect md5 `cd3bc440dff82c9962c682eccf9faecd`) and HEAD
+codecs (expect `50ac62ae467218043def9c32a3d2bd5e`), then run `--prompt-ids @parity/prompt512_cma.ids --spec-check 64`
+on each. If pre-commit matches and post-commit diverges, revert `2460e04a3` -- the +1.9% (gen 64) / +2.7% (gen 256)
+decode gain does not justify speculation that is not lossless. If both diverge, the invariant is fragile upstream
+and the finding belongs in an upstream issue, not in this branch.
+
+Independent of that outcome: **logit parity gates in this backend must cover B=1..8.** A B=1 + B=256 gate
+demonstrably failed to catch a behavioural change in a kernel that also serves B=2..4.
+
 ## Headline: same protocol as the baseline (prompt 2048, gen 64, speculation on)
 
 | metric | baseline `2af30cc` | after `2460e04a3` | change |
