@@ -1,0 +1,162 @@
+# Inkling 2 Mini SQ-10 on an RX 6700 XT eGPU (gfx1031) — RDNA2 grouped-MoE work
+
+Protocol: `strata-inkling --bench --native <SQ-10.strata> --parallel 1 --kv fp8 --vram-experts-gb 8.77 --ram-experts-gb 0`.
+Numbers are this machine only; nothing here is a statement about other AMD cards or later releases.
+
+- **Hardware:** Dell Latitude 5420 + Razer Core X eGPU, AMD RX 6700 XT (`gfx1031`), 12 GiB VRAM, 384 GB/s GDDR6,
+  96 MB Infinity Cache. RDNA2: **no matrix cores** (zero WMMA intrinsics on gfx103x), `fdot2` available, no hipBLASLt.
+  Thunderbolt 3 Gen3 x4 host link, measured ~3.9 GB/s raw — relevant because any expert placed in system RAM is slow.
+- **Model:** Inkling-2-Mini-SQ-10, 26.4 B total / 3.4 B active (5.4 B looped-active across 48 virtual visits),
+  `CODE_SF4` expert weights (4-bit e2m1 + e4m3 block scales), all experts in VRAM.
+- **Branch:** `rdna2-moe-lds-staging`. **Binary under test:** `2460e04a3`, md5 `50ac62ae467218043def9c32a3d2bd5e`;
+  the clean baseline `a0e388d` was md5 `cd3bc440dff82c9962c682eccf9faecd`. ROCm libs come from the stock
+  `0.1.67-linux-x86_64-hip-rx6000` component package (the `enginetest` dir used throughout is only symlinks to it).
+- **Dates:** 2026-11-25 → 2026-11-26.
+
+## Headline: same protocol as the baseline (prompt 2048, gen 64, speculation on)
+
+| metric | baseline `2af30cc` | after `2460e04a3` | change |
+|---|---:|---:|---:|
+| prefill | 117.1 ppts | 186.7–187.0 ppts | **+59.5%** |
+| time to first token (2048 tok) | 17.49 s | 10.96 s | −37.3% |
+| decode | 35.4 tps | 40.9–41.0 tps | **+15.8%** |
+
+Per commit, prefill ppts (prompt 2048):
+
+| commit | what | prefill | step Δ |
+|---|---|---:|---:|
+| `2af30cc` | fork base | 117.1 | — |
+| `3974192` | LDS slice staging in grouped MoE (bit-identical) | 160.4 | +37.0% |
+| `d613831` | grouped w13 → 8 waves/SIMD (bit-identical) | 171.7 | +7.1% |
+| `9df38f5` | grouped w2 → 8 waves/SIMD (bit-identical) | 177.3 | +3.3% |
+| `a0e388d` | prefill chunk 512 as default on tight-VRAM cards, sized from `estimate_batch_scratch_bytes()` | 186.9 | +5.5% |
+| `2460e04a3` | decode-only `k_moe_direct_w13_situ` → 16 waves/SIMD | 186.9 | 0 (decode only) |
+
+`2460e04a3` moves **decode**, and only at long measurement windows — which is why the gen-64 row above does not show it:
+
+| window | bar (`a0e388d`) | after `2460e04a3` | Δ |
+|---|---:|---:|---:|
+| 2048 × gen 256 | 51.0 tps | 52.6 / 52.4 / 52.3 | +2.7% |
+| 8192 × gen 512 | 46.9 tps | 48.0 / 47.9 | +2.2% |
+| 512 × gen 256 | 25.8 tps | 26.6 | +3.1% |
+| prefill (drift control) | 186.7–187.0 | 186.7–186.9 | flat |
+
+Every shipped change is **bit-identical**: `--kld-eval` against `ref_512_c256.bin` gives
+`n=511 Mean KLD=0.000000 | Top-1=100.00% | PPL=1101.388` before and after.
+
+## Decode composition (B=1, `STRATA_HIP_PROF=2`, prompt 2048)
+
+One full forward = 30.4 ms. Dense linear is half of it; MoE is a third.
+
+| component | ms | share |
+|---|---:|---:|
+| dense linear (`qkvrg` 6.99 + `wo_post` 4.51 + `res_ctrl` 2.2 + `prep` 1.4) | 15.1 | 50% |
+| MoE (`moe_w13` 5.71 + `moe_w2_post` 3.93) | 9.6 | 32% |
+| attention + shortconv (`attn` 3.91 + `sconv` 1.8) | 5.7 | 19% |
+| unembed (overlaps) | 2.4 | 8% |
+
+Kernel occupancy at HEAD, and what limits each (`-Rpass-analysis=kernel-resource-usage`, compile-only):
+
+| kernel | VGPRs | LDS | waves/SIMD | limited by |
+|---|---:|---:|---:|---|
+| `k_moe_direct_w13_situ` | 74 → **64** | 7,200 B | 12 → **16** | was registers; LDS allowed 18 |
+| `k_moe_direct_w2_reduce` | 127 | 512 B | 8 | registers; 16 needs ~56 VGPRs → would spill hard. **Not attempted.** |
+| `k_bf16_gemv1_qkvrg` | 38 | 16,384 B | 16 | hardware ceiling |
+| `k_bf16_gemv1_wo_sconv` | 38 | 16,384 B | 16 | hardware ceiling |
+| `k_moe_grouped_w13_situ` | — | — | 8 | raised in `d613831`, spill-free |
+
+Note `2460e04a3` is **not** spill-free: 64 VGPRs costs 8 spilled VGPRs / `ScratchSize 36 B/lane`. I expected that to
+cancel the gain. It did not, measured across three runs. A spill is a cost to measure, not an automatic veto.
+`(256, 14)` and `(256, 16)` generate identical code — the compiler clamps at 64 VGPRs either way.
+
+## Ceilings found by measurement, not inference
+
+- **Prefill chunk 512 is a hard ceiling here, for two independent reasons.** (1) SWA KV ring: `swa_span_cap_ = swa_ring_ - swa_win`,
+  and a batch may not span more than that or it overwrites keys its own earlier queries still need. The ring is sized
+  from the `--chunk` option, so `STRATA_MAX_PREFILL_CHUNK` alone silently re-splits at 512 — the two must be set together.
+  (2) Batch scratch: raising the chunk past 512 OOMs (`[ink-hip] scratch alloc: out of memory`). Both were found by
+  running it, and both are already known to the codebase — this fix landed upstream earlier via #6878.
+- **`STRATA_MAX_PREFILL_CHUNK` is scratch-aware:** the override halves itself via `estimate_batch_scratch_bytes()`
+  and prints why (1024 → clamped to 512, 4096 → clamped to 512, no OOM). The chunk decision uses the engine's own
+  estimate rather than a free-VRAM proxy.
+- **Speculative decoding changes sign with context length** (gen 256, steady state):
+
+  | prompt | spec ON | `--draft off` | Δ |
+  |---|---:|---:|---:|
+  | 512 | 25.8 tps | **34.2 tps** | **−24.6%** |
+  | 2048 | **51.0 tps** | 32.8 tps | +55.5% |
+  | 8192 | **41.9 tps** | 30.7 tps | +36.5% |
+
+  At prompt 512 speculation is a flat ~9.6 ms/token tax on an otherwise identical ~30 ms forward. The HIP fused path
+  `dspark_spec_step_greedy` (`ink_hip_backend.hip.cpp:2174`) uses a **fixed** 8-wide tree with **no acceptance-based
+  throttle at all**, so nothing disables speculation when it is losing. The `adapt_max`/EMA backoff exists only in
+  `dspark_draft()`, which `ink_main.cpp:686` reaches only as a fallback. Acceptance itself is **not measured here**:
+  the counters print only under `--spec-check` (`ink_main.cpp:743`), and `STRATA_HIP_DSPARK_PROF` / `STRATA_HIP_TREE_PROF`
+  emit nothing in this configuration, so do not reuse any acceptance figure derived from the 2048 numbers.
+
+## Not shipped, and why
+
+- **`STRATA_HIP_MOE_I8=1` (SF4 int8 grouped MoE on RDNA2): 2.05× prefill, numerically destroyed.** 381.7/381.8 ppts
+  @2048 and 282.9 @8192, but `Mean KLD=3.590106`, Top-1 **46.18%**, **PPL 58,222.513** vs 1,101.388, and decode fell
+  51.1 → 44.0 tps as wrong verify logits collapsed draft acceptance. Ruled out: wrong codec routing (`CODE_SF4` →
+  `layer_gu_class_ == 1`, the SF4 kernel provably ran) and a missing activation hand-off (`k_quant_f16_to_q8_16` runs
+  before w2). The fault is in the int8 kernels' RDNA2 lowering. Requires lifting the `use_i8_moe_wmma_ = (gen == AmdGen::Rdna4)`
+  guard locally to reach at all, so it is unreachable in stock builds. Patch kept at
+  `scratch/strata_hip_moe_i8_gate.patch` (22 lines). **Not shippable.**
+- **Two-row GEMM variant and a 9-wave occupancy bump:** reverted, measured regression/softness.
+- **`STRATA_INK_MOE_TILED`:** the gate sits inside the `ep2_active_` dual-GPU branch, so it never executes on one GPU —
+  a null result there was dead code, not a finding.
+- **`--draft-beam` / `--draft-cost` / `--draft-plain` / `STRATA_INK_SPEC_BEAM`:** CUDA-backend-only, inert on HIP `--bench`.
+- **MTP drafting on gfx1031:** upstream #6343 reports 0/N drafts accepted; not usable here.
+
+## Prior art — most of this was independently in flight
+
+Upstream `main` has **zero** commits under `engine/src/inkling2/hip/` since the fork base, and its own v0.2.22 notes say
+the AMD/Intel/Apple Inkling engines "stay 0.1.67, because nothing in them changed". But the same ideas exist as open,
+unmerged PRs from different authors, several **predating** our commits:
+
+| PR | created | content | relation |
+|---|---|---|---|
+| #7009 | 2026-11-24 | `k_moe_grouped_{w13,w2}_wmma_sf4_i8_n8`, int8 WMMA, BM=32/BN=128, 8 waves across columns, env `STRATA_INK_TOPUP_MOE`, B 64..256 | **predates ours.** Thematic overlap only — needs WMMA, cannot run on gfx103x. Its gate has **no arch check**, unlike `use_i8_moe_wmma_`, so on an RDNA2 build that env var reaches a path this document measures as PPL 58,222 |
+| #7110 | 2026-11-25 03:36Z | `STRATA_INK_MAX_PREFILL_CHUNK`, +7 lines | same-morning duplicate of our `b2de3d4` intent; ours derives the cap from the scratch estimate |
+| #6932 | 2026-11-23 | fix wrong output past 1024 tokens (SWA ring), `kSwaRingSlack=1024` | our fork base already fixes this via #6878 (`swa_ring_`, 13 wrap sites, mechanism documented at `ink_hip_backend.hip.cpp:718`) |
+| #2399 | 2026-10-14 | elastic expert cache + growing K/V on HIP | predates our KV-grow/graph-recapture analysis |
+| #6850 | 2026-11-23 | gfx103x int8 MMQ prefill, "no card report yet" | the SF4 int8 path measured above |
+
+Method note, kept deliberately: every prior-art check before 2026-11-26 was `hip in:title`. The correct query — all open
+PRs touching this backend — found three near-duplicates in one command. **Sweep the lane before claiming a finding.**
+
+## Measurement lessons that changed conclusions
+
+- **Vary the window; never trust one number.** Decode was measured at gen 4/32/64/128/256; short windows understate by
+  up to 25% (25.8 @gen4 → 41.0 @gen64 → 51.0 @gen256 for the same binary).
+- **A one-time cost divided by a short window looks like a regression.** "chunk 512 regresses decode" was self-inflicted:
+  a KV-pool grow bumps `pool_gen` → `kv_gen_sum` → breaks decode-graph reuse (`graph_kv_gen_ == kv_gen_sum`) → the graph
+  is destroyed and recaptured **once** (~100 ms). Flat +0.09/0.10/0.11 s at gen 32/128/512 proved it was one event.
+  Freeing 480 MiB did not recover decode, so VRAM pressure was ruled out by experiment, not assumption.
+- **Compare against a bar from the same protocol.** An earlier 41.9 tps figure for 8192 × gen 512 was stale noise;
+  the true comparable was 46.9, so a +2.2% win would have been reported as +14.6%.
+- **`steps=` in `STRATA_HIP_PROF` output is the sample count, not decode steps**, and decode emits only `B=1` / `B=512`
+  buckets under tracing — do not infer verify batch shapes from it.
+- Build gotchas: `cmake --build` **must** pass `--target strata-inkling` (an unrelated target fails otherwise), and never
+  pipe the build through `tail` — it destroys the error text and hides the exit code from `set -e`.
+
+## Reproducing
+
+```sh
+export LD_LIBRARY_PATH=/mnt/win/llm-temp/enginetest   # symlinks into the stock hip-rx6000 component
+cd /mnt/win/llm-temp/build-ink && cmake --build . --target strata-inkling -j"$(nproc)"
+cd src/inkling2 && ./strata-inkling --bench --native "$MODEL" --parallel 1 --kv fp8 \
+    --vram-experts-gb 8.77 --ram-experts-gb 0 --prompt-len 2048 --gen 256
+# parity (must be KLD=0.000000):
+./strata-inkling --native "$MODEL" ... --prompt-ids @prompt512_cma.ids --kld-eval ref_512_c256.bin
+```
+
+Hardware-counter profiling (rocprofv3): needs `sudo sysctl -w kernel.perf_event_paranoid=2` (restore to 4 afterwards),
+the `libhsa-amd-aqlprofile64.so.1` plugin, and the `.1.1.0`→`.1.1.1.0` symlink fix described in `SESSION-LOG.md` §18.
+
+## Files here
+
+- `SESSION-LOG.md` — the full working log, 31 sections, including the places the record corrects itself.
+  One line about this box's local disk encryption was redacted for publication.
+- `UPSTREAM-NOTES.md` — two upstream **issue** drafts (no pull requests). **Neither has been posted.**
