@@ -166,3 +166,15 @@ Added a temporary two-way unroll to the S2_K/S3_K multi-token inner loops. Each 
 | Two-way unroll for S2_K/S3_K | 189.5, 189.6 prefill; 53.4, 53.8 decode tok/s | Reject; no gain |
 
 The unroll was reverted. Token-loop control was not a meaningful limiter for this kernel on the tested workload.
+
+### Experimental S_K Q8 activations + RDNA2 `sdot4` W13 (2026-11-26)
+
+The repository already has per-64 activation Q8 quantization for newer WMMA paths, and gfx1031 exposes `sdot4`. I prototyped a large-batch S_K W13 route that quantized the FP32 activations once per 64 values, unpacked eight signed integer weights per lane, and accumulated with two `sdot4` operations. The first version read Q8 activations directly; the second added the existing W13-style double-buffered shared activation staging.
+
+| Candidate | 2K prompt / 256 generated, two warmed runs | Decision |
+|---|---|---|
+| Existing FP16/fdot2 grouped W13 | 189.8–190.1 prefill; 53.6–53.8 decode tok/s | Keep |
+| Q8 + sdot4, direct Xq loads | 172.9, 173.5 prefill; 53.3, 53.5 decode tok/s | Reject |
+| Q8 + sdot4, shared Xq staging | 166.4, 167.0 prefill; 53.3, 53.6 decode tok/s | Reject |
+
+Both experimental kernels and dispatch were reverted. Neither was fast enough to justify measuring its approximate activation quantization quality. The integer-dot idea is not promising in this scalar mapping; weight unpack and per-subgroup scale work likely outweighed the cheaper dot instruction (inference from the timing and source structure).
