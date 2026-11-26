@@ -9,14 +9,14 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
 - **Model:** Inkling-2-Mini-SQ-10, 26.4 B total / 3.4 B active (5.4 B looped-active across 48 virtual visits),
   expert weights in VRAM. Measured directory mix (24 layers x 128 experts): 585 S2_K, 2,472 S3_K, and
   15 SF4 (4-bit e2m1 + e4m3 block scales); the older description of this model as all SF4 was stale.
-- **Branch:** `rdna2-moe-lds-staging`. **Deployed binary:** current HEAD `427074dd4`, md5
-  `1a0591217d853a89e9bd673b1d48aeae`, copied to `engines/inkling2-rdna2-local/strata-inkling` on 2026-11-26;
+- **Branch:** `rdna2-moe-lds-staging`. **Deployed binary:** current HEAD `6a6f3907f`, md5
+  `efc346880b512da0a954f5a0ea4abb68`, copied to `engines/inkling2-rdna2-local/strata-inkling` on 2026-11-26;
   the previous `2460e04a3` binary (`50ac62ae467218043def9c32a3d2bd5e`) is kept as `strata-inkling.prev-50ac62ae`.
   The clean baseline `a0e388d` was md5 `cd3bc440dff82c9962c682eccf9faecd`. ROCm libs come from the stock
   `0.1.67-linux-x86_64-hip-rx6000` component package (the `enginetest` dir used throughout is only symlinks to it).
 - **Dates:** 2026-11-25 → 2026-11-26.
 - **Kernel changes at HEAD:** `52ba23bfc` adds branchless E4M3 decode and the S2/S3 W13 pair
-  LUT on top of `2460e04a3`; `427074dd4` makes greedy decoding the default. The OPEN speculative-path item below still applies to this build. Those two
+  LUT on top of `2460e04a3`; `427074dd4` makes greedy decoding the default; `6a6f3907f` adds serving-side hybrid KV. The OPEN speculative-path item below still applies to this build. Those two
   changes touch FP8 attention and grouped-W13 weight unpacking only.
 
 ## OPEN -- possible correctness regression in `2460e04a3`; do not treat its "bit-identical" label as settled
@@ -129,9 +129,8 @@ enabled explicitly with `--draft dspark`. This was decided by measuring, not ass
 The 55 tok/s decode figures recorded earlier in this branch came from the speculative path that was on by
 default at the time; they are throughput measurements and are not covered by the lossless guarantee.
 
-The serving profile keeps 7.08 GiB VRAM experts plus 1.69 GiB RAM experts: an all-VRAM selfcheck passes
-with 1,710 MiB free, but a 131,072-token KV cache would then spill to host, so the existing split is
-retained for long-context headroom.
+The serving profile now places all experts in VRAM (8.77 GiB, 0 RAM). The hybrid section below records
+the measured prefill gain and the long-context fallback for requests whose KV would spill to host.
 
 ## Hybrid KV is now the serving default (2026-11-26)
 
