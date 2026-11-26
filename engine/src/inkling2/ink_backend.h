@@ -123,6 +123,12 @@ public:
         TapCapture* taps_out,
         std::string& err) = 0;
 
+    // Optional benchmark/research hook for phase-specific KV experiments.
+    virtual bool switch_kv_to_fp8(std::string& err) {
+        err = "this backend cannot switch its KV cache to FP8";
+        return false;
+    }
+
     // The same step, but a row of logits is not copied to the host: the backend returns, per wanted row, the kInkCandidates best
     // token ids with their logits (larger logit first, the smaller id first on equal logits - the order the sampler uses) and a
     // flag telling whether the row's every 67th logit is finite (what the host check looked at).  That is 128 x 8 bytes per row

@@ -3282,7 +3282,7 @@ __global__ void __launch_bounds__(256, 16) k_moe_direct_w13_situ(
 // Stage 2A (Wave-6): Parallel-Expert w2 across all (b, k) active experts -> 8x more blocks (2,304 at B=1!),
 // LDS-cached sA[1024] (2 KB shared by all 8 waves), 1 KB SF4 LUT, zero-switch S2_K/S3_K hot loops!
 // Grid: ((D + 7) / 8, B * top_k), Block: 256
-__global__ void __launch_bounds__(256) k_moe_direct_w2_par(
+__global__ void __launch_bounds__(256, 16) k_moe_direct_w2_par(
     const GpuExpertDesc* __restrict__ exps,   // [128]
     const int32_t* __restrict__ topk_ids,     // [B, top_k]
     const half_t* __restrict__ act_in,        // [B * top_k, inter]

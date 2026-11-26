@@ -513,6 +513,69 @@ public:
 
     int effective_max_ctx() const override { return max_ctx_; }
 
+    bool switch_kv_to_fp8(std::string& err) override {
+        if (default_kv_dtype_ == KvDtype::FP8_E4M3) return true;
+        if (mem_info_.is_uma || ep2_active_) {
+            err = "FP16-to-FP8 KV switching is limited to a single discrete GPU";
+            return false;
+        }
+        for (const auto& p : swa_pools_) if (p.host_offload) {
+            err = "[ink-hip] cannot switch KV format while SWA pages are host-mapped";
+            return false;
+        }
+        for (const auto& p : glob_pools_) if (p.host_offload) {
+            err = "[ink-hip] cannot switch KV format while global pages are host-mapped";
+            return false;
+        }
+        auto convert = [&](VisitKvPool& p) -> bool {
+            if (p.used_pages == 0) {
+                p.is_fp8 = true;
+                p.cap_pages = 0;
+                ++p.pool_gen;
+                return true;
+            }
+            const size_t n_pages = static_cast<size_t>(p.used_pages);
+            const size_t data_bytes = n_pages * kKvPageTokens * static_cast<size_t>(p.kv_dim);
+            const size_t scale_bytes = n_pages * kKvPageTokens * sizeof(float);
+            GpuBuffer k, v, ks, vs;
+            if (alloc_gpu_buffer(k, data_bytes, false) != hipSuccess ||
+                alloc_gpu_buffer(v, data_bytes, false) != hipSuccess ||
+                alloc_gpu_buffer(ks, scale_bytes, false) != hipSuccess ||
+                alloc_gpu_buffer(vs, scale_bytes, false) != hipSuccess) {
+                free_gpu_buffer(k); free_gpu_buffer(v);
+                free_gpu_buffer(ks); free_gpu_buffer(vs);
+                err = "[ink-hip] FP8 KV conversion temporary allocation failed";
+                return false;
+            }
+            const int n_tokens = p.used_pages * kKvPageTokens;
+            k3_kv_f16_to_fp8_pages<<<n_tokens, 256, 0, stream_>>>(
+                reinterpret_cast<const half_t*>(p.k_pool.dev_ptr),
+                reinterpret_cast<const half_t*>(p.v_pool.dev_ptr),
+                k.dev_ptr, v.dev_ptr,
+                reinterpret_cast<float*>(ks.dev_ptr), reinterpret_cast<float*>(vs.dev_ptr),
+                n_tokens, p.kv_dim);
+            if (!hip_ok(hipGetLastError(), "FP8 KV conversion launch", err) ||
+                !hip_ok(hipStreamSynchronize(stream_), "FP8 KV conversion sync", err)) {
+                free_gpu_buffer(k); free_gpu_buffer(v);
+                free_gpu_buffer(ks); free_gpu_buffer(vs);
+                return false;
+            }
+            free_gpu_buffer(p.k_pool); free_gpu_buffer(p.v_pool);
+            free_gpu_buffer(p.k_scales); free_gpu_buffer(p.v_scales);
+            p.k_pool = k; p.v_pool = v; p.k_scales = ks; p.v_scales = vs;
+            p.is_fp8 = true;
+            p.cap_pages = p.used_pages;
+            p.host_offload = false;
+            ++p.pool_gen;
+            return true;
+        };
+        for (auto& p : swa_pools_) if (!convert(p)) return false;
+        for (auto& p : glob_pools_) if (!convert(p)) return false;
+        default_kv_dtype_ = KvDtype::FP8_E4M3;
+        std::fprintf(stderr, "[ink-hip] converted resident KV pages FP16 -> FP8 before decode\n");
+        return true;
+    }
+
     bool dspark_ready() const override { return has_dspark_; }
 
     std::string device_info() const override {

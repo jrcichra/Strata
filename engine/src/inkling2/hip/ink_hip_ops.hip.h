@@ -1570,6 +1570,49 @@ __global__ void __launch_bounds__(128) k2_qrkv_kvstore_relpos_fused(
 // Clean Wave32 online-softmax implementation — works identically on RDNA4, RDNA3/3.5, and RDNA2!
 // =================================================================================================
 
+
+__global__ void __launch_bounds__(256) k3_kv_f16_to_fp8_pages(
+    const half_t* __restrict__ k_src,
+    const half_t* __restrict__ v_src,
+    uint8_t* __restrict__ k_dst,
+    uint8_t* __restrict__ v_dst,
+    float* __restrict__ k_scales,
+    float* __restrict__ v_scales,
+    int n_tokens, int kv_dim) {
+    const int tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const half_t* ks = k_src + static_cast<size_t>(tok) * kv_dim;
+    const half_t* vs = v_src + static_cast<size_t>(tok) * kv_dim;
+    __shared__ float sk[8], sv[8], ik, iv;
+    float km = 0.0f, vm = 0.0f;
+    for (int i = tid; i < kv_dim; i += 256) {
+        km = fmaxf(km, fabsf(static_cast<float>(ks[i])));
+        vm = fmaxf(vm, fabsf(static_cast<float>(vs[i])));
+    }
+    km = wave32_max(km);
+    vm = wave32_max(vm);
+    if (lane == 0) { sk[wave] = km; sv[wave] = vm; }
+    __syncthreads();
+    if (tid == 0) {
+        float mk = 0.0f, mv = 0.0f;
+        for (int w = 0; w < 8; ++w) { mk = fmaxf(mk, sk[w]); mv = fmaxf(mv, sv[w]); }
+        const float ksc = (mk > 1e-12f) ? mk * (1.0f / 448.0f) : 1.0f;
+        const float vsc = (mv > 1e-12f) ? mv * (1.0f / 448.0f) : 1.0f;
+        k_scales[tok] = ksc; v_scales[tok] = vsc;
+        ik = 1.0f / ksc; iv = 1.0f / vsc;
+    }
+    __syncthreads();
+    uint8_t* kd = k_dst + static_cast<size_t>(tok) * kv_dim;
+    uint8_t* vd = v_dst + static_cast<size_t>(tok) * kv_dim;
+    for (int i = tid; i < kv_dim; i += 256) {
+        kd[i] = f32_to_e4m3fn(static_cast<float>(ks[i]) * ik);
+        vd[i] = f32_to_e4m3fn(static_cast<float>(vs[i]) * iv);
+    }
+}
+
 // Store newly computed K/V (head_dim=128, n_kv_heads=8) into paged KV pool (page_size=64).
 // For FP8_KV, computes exact per-token scale = amax / 448.0f (matching SlotKvPages in ink_batch.h!).
 // Grid: (M,), Block: 256

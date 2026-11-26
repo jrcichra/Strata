@@ -194,6 +194,12 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     }
 
     double t_dec0 = now_s();
+    if (const char* cv = std::getenv("STRATA_BENCH_FP8_DECODE"); cv && std::atoi(cv) != 0) {
+        if (!backend->switch_kv_to_fp8(err)) {
+            fprintf(stderr, "bench KV conversion err: %s\n", err.c_str());
+            return 1;
+        }
+    }
     int total_gen = 0;
     if (use_dspark && P == 1) {
         int cur_pos = prompt_len;
@@ -285,15 +291,37 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
 
     std::vector<float> got_lg(static_cast<size_t>(n_tok) * V);
     StepBatch batch;
-    for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
-    if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
-        fprintf(stderr, "forward: %s\n", err.c_str());
-        return 1;
+    int begin_eval = 0;
+    const char* hybrid_env = std::getenv("STRATA_BENCH_FP8_DECODE");
+    if (hybrid_env && std::atoi(hybrid_env) != 0) {
+        const int split = n_tok / 2;
+        for (int i = 0; i < split; ++i) batch.push(0, i, ids[i], true);
+        if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
+            fprintf(stderr, "forward pre-conversion: %s\n", err.c_str());
+            return 1;
+        }
+        if (!backend->switch_kv_to_fp8(err)) {
+            fprintf(stderr, "KV conversion: %s\n", err.c_str());
+            return 1;
+        }
+        batch.clear();
+        for (int i = split; i < n_tok; ++i) batch.push(0, i, ids[i], true);
+        if (!backend->forward_batch(batch, got_lg.data() + static_cast<size_t>(split) * V, nullptr, err)) {
+            fprintf(stderr, "forward post-conversion: %s\n", err.c_str());
+            return 1;
+        }
+        begin_eval = split;
+    } else {
+        for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
+        if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
+            fprintf(stderr, "forward: %s\n", err.c_str());
+            return 1;
+        }
     }
 
     double kld_sum = 0.0, nll_sum = 0.0;
     int top1_ok = 0;
-    for (int t = 0; t < n_tok - 1; ++t) {
+    for (int t = begin_eval; t < n_tok - 1; ++t) {
         const float* p_lg = ref_lg.data() + static_cast<size_t>(t) * V;
         const float* q_lg = got_lg.data() + static_cast<size_t>(t) * V;
         float mp = p_lg[0], mq = q_lg[0];
@@ -316,7 +344,7 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
         kld_sum += kld;
         nll_sum += -(q_lg[ids[t + 1]] - lzq);
     }
-    const int n_eval = n_tok - 1;
+    const int n_eval = n_tok - 1 - begin_eval;
     printf("[kld-eval] n=%d | Mean KLD=%.6f | Top-1=%.2f%% | PPL=%.3f\n",
            n_eval, kld_sum / n_eval, 100.0 * top1_ok / n_eval, std::exp(nll_sum / n_eval));
     return 0;
