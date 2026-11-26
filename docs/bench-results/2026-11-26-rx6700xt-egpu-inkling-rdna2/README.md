@@ -66,6 +66,26 @@ demonstrably failed to catch a behavioural change in a kernel that also serves B
 | time to first token (2048 tok) | 17.49 s | 10.96 s | −37.3% |
 | decode | 35.4 tps | 41.7–41.8 tps | **+18.1%** |
 
+### Current fork total versus the fork base (added 2026-11-26)
+
+Measured with the same prompt 2048 / gen 64 / speculation-on protocol used for the baseline above.
+Current binary is `13aa95a90` on the `rdna2-moe-lds-staging` branch.
+
+| metric | fork base `2af30cc` | current `13aa95a90` | change |
+|---|---:|---:|---:|
+| prefill | 117.1 ppts | 196.2 ppts | **+67.6%** |
+| time to first token (2048 tokens) | 17.49 s | 10.44 s | −40.3% |
+| decode | 35.4 tps | 43.4 tps | **+22.6%** |
+
+On the separate greedy protocol used for the latest kernel A/B (prompt 2048 / gen 256, `--draft off`),
+the two changes in `52ba23bfc` moved prefill 189.8 -> 196.3 tok/s (+3.4%) and decode 53.8 -> 55.3
+tok/s (+2.8%).
+
+Quality gate on the current binary: `--kld-eval ref_512_c256.bin` with 511 teacher-forced positions
+gives `Mean KLD=0.000000 | Top-1=100.00% | PPL=1101.388`, identical to the baseline reference value.
+The opt-in FP16-prefill/FP8-decode benchmark hook and the open speculative-path item above are not
+part of these totals.
+
 Per commit, prefill ppts (prompt 2048):
 
 | commit | what | prefill | step Δ |
