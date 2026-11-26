@@ -142,3 +142,5 @@ The batch-one W/O projection kernel maps one wave to each output row and stages 
 | 128 threads / 4 rows | 50.1, 50.3 decode tok/s; 189.5, 189.9 prefill tok/s | Reject; about 6.7% slower decode |
 
 The experiment and its block-size-aware LDS copy are reverted. More blocks did not compensate for the smaller CTA on this GPU.
+
+A second W/O geometry trial used 512 threads / 16 rows per CTA. The two warmed decode runs were 55.3 and 52.6 tok/s (mean 53.95), against 53.7 and 54.0 tok/s for the 256-thread control (mean 53.85). The spread is larger than the mean difference, so there is no repeatable gain; the 512-thread change was reverted. The established 256-thread / 8-row geometry remains the production setting.
