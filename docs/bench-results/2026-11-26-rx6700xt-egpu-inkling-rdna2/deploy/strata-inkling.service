@@ -1,0 +1,32 @@
+[Unit]
+Description=Strata inference server (Inkling 2 Mini SQ-10 on RX 6700 XT, HIP)
+Documentation=https://github.com/Niko1221/Strata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=STRATA_COMPONENTS_DIR=/home/ubuntu/.local/share/strata/components
+# Only needed if the engine is pointed at the locally built HIP binary; harmless otherwise.
+Environment=LD_LIBRARY_PATH=/mnt/win/llm-temp/enginetest
+EnvironmentFile=/etc/strata/inkling.env
+# STRATA_API_KEY makes the DNS-rebinding Host check (#7130) accept any Host, which is what
+# reaching this server by LAN IP needs. Without it, 0.0.0.0 would 403 every remote request.
+ExecStart=/home/ubuntu/.local/bin/strata serve \
+    --profile /home/ubuntu/.local/share/strata/install/strata-inkling-2-mini-sq-10-rdna2.json \
+    --host 0.0.0.0 --port 8095
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+SupplementaryGroups=video render
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

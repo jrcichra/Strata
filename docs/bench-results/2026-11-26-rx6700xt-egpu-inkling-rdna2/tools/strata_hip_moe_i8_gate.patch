@@ -1,0 +1,22 @@
+diff --git a/engine/src/inkling2/hip/ink_hip_backend.hip.cpp b/engine/src/inkling2/hip/ink_hip_backend.hip.cpp
+index bf5fb84..d4b4018 100644
+--- a/engine/src/inkling2/hip/ink_hip_backend.hip.cpp
++++ b/engine/src/inkling2/hip/ink_hip_backend.hip.cpp
+@@ -4389,7 +4389,16 @@ private:
+                 } else {
+                     k_moe_build_buckets<<<1, 128, 0, stream_>>>(tk_i, d_off, d_btk, d_s2b, B, c_.top_k);
+                 }
+-                if (mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) {
++                // Opt-in experiment: let RDNA2 onto the int8 grouped-MoE path when STRATA_HIP_MOE_I8 forces
++                // use_i8_moe_wmma_. Upstream keeps this branch to RDNA4 ("true 2x-rate 16x16x32 iu8 WMMA") and
++                // reports RDNA3/3.5 winning with FP16 WMMA, so the prior for gfx103x is not good. But RDNA2's
++                // alternative here is not FP16 WMMA -- it is the scalar FP16 fallback further below -- and this is
++                // the only place the engine has an SF4 int8 kernel (layer_gu_class_ == 1 -> k_quant_f32_to_q8_16 +
++                // k_moe_grouped_w13_situ_wmma_sf4_i8_128), i.e. the same q8_16 x int8-codebook recipe that PR
++                // #6850 added for trellis experts on gfx103x. Default (env unset) leaves behaviour unchanged:
++                // use_i8_moe_wmma_ is false on RDNA2, so the second clause never fires.
++                if ((mem_info_.gen != AmdGen::Rdna2 && mem_info_.gen != AmdGen::Unknown) ||
++                    (use_i8_moe_wmma_ && mem_info_.gen == AmdGen::Rdna2)) {
+                     if (B >= 64) {
+                         // Wave-5 BM=128, BN=128 Grouped-MoE with m_tiles=8 hot-expert fan-out!
+                         // Cold/avg experts (m_e <= 128) exit z>=1 on instruction #1 -> 1.0x W reads;

@@ -160,3 +160,29 @@ the `libhsa-amd-aqlprofile64.so.1` plugin, and the `.1.1.0`→`.1.1.1.0` symlink
 - `SESSION-LOG.md` — the full working log, 31 sections, including the places the record corrects itself.
   One line about this box's local disk encryption was redacted for publication.
 - `UPSTREAM-NOTES.md` — two upstream **issue** drafts (no pull requests). **Neither has been posted.**
+
+## What lives where, and what survives a reboot or a cleanup
+
+Added while planning to wipe `/mnt/win/llm-temp`. Read this before deleting anything.
+
+**`/` is an overlay over live squashfs (`/cow`), so the entire Linux side is in RAM and does not survive a
+reboot.** That includes the installed Strata Terminal CLI, `~/.local/share/strata` (engine components *and*
+the ROCm libraries our build links against), the run-config profiles, the systemd unit, and the API-key file.
+Only `/mnt/win` is persistent. `deploy/restore.sh` re-creates the RAM-side pieces.
+
+| path | size | survives reboot | survives `llm-temp` cleanup | recovery |
+|---|---:|---|---|---|
+| `strata-src/` | 297 MB | no (it's on `/mnt/win`, so yes) | **no** | already in git: `myfork/rdna2-moe-lds-staging` |
+| `build-ink/` | 76 MB | yes | no | rebuild: `cmake --build build-ink --target strata-inkling` |
+| `engines/inkling2-rdna2-local/` | 274 MB | yes | **no** | derived from build; **the systemd profile `exe` points here** |
+| `enginetest/` | 3.6 MB | yes | no | symlinks into the stock `hip-rx6000` component; recreate with `ln -s` |
+| `scratch/parity/*.bin` | ~2.3 GB | yes | **no** | re-derivable from the baseline commit + GPU time; keep the small `.ids` files |
+| `strata-models/` | **11 GB** | yes | **no** | not in git — confirm it can be re-fetched *before* deleting |
+| `.gh/auth.log` | 304 B | yes | no | gh credentials, plaintext on a Windows volume; re-auth if lost |
+| `rocprof/` | 53 MB | yes | no | re-download the ROCm counter debs |
+| `scratch/*.sh`, `bench/*.hip.cpp` | ~40 KB | yes | no | **now committed under `tools/` in this folder** |
+
+Consequence worth stating plainly: **deleting `llm-temp` breaks the serving unit**, because its profile's
+`exe` is `/mnt/win/llm-temp/engines/inkling2-rdna2-local/strata-inkling` and its model is
+`/mnt/win/llm-temp/strata-models/...`. Either move those two out from under the cleanup path and update the
+profile, or expect to re-run `deploy/restore.sh`.
