@@ -115,6 +115,19 @@ The model state width is 2,304. The fused post-W2 reducer therefore launches onl
 
 All candidates were temporary and reverted. The existing parallel per-expert W2 kernels remain the best measured decode route.
 
+
+### W2 activation staging and dot-chain follow-up (2026-11-26)
+
+A temporary host-side descriptor read during batch-one decode found `inter=1152`; among the observed routed experts, down formats were S2_K (107), S3_K (34), and SF4 (1). The diagnostic was removed afterward. The 1152-wide activation is just beyond the original LDS cache limit of 1024 elements.
+
+| Candidate | 2K / 256 generated decode tok/s | Serial decode KLD (511 positions) | Result |
+|---|---:|---:|---|
+| Stage up to 1536 activation elements in LDS | 53.4, 53.7, 53.6 | Arithmetic unchanged | No gain vs ~53.9 control |
+| Split each four-instruction `fdot2` chain into two independent chains | 52.2, 52.5, 52.5 | 0.001721; top-1 99.61%; PPL 1097.151 | Slower and slightly worse KLD/PPL than baseline serial 0.001664 / 99.61% / 1096.142 |
+| Use two accumulators across the S2_K/S3_K subgroup loop | 48.1, 48.4, 48.4 | Not run after clear speed regression | Reject |
+
+These candidates are reverted. Larger shared staging did not help, suggesting the repeated activation loads are already served cheaply enough from cache. The original single-chain dot order remains the fastest tested W2 path.
+
 ## Upstream version check
 
 The checked-out source is `v0.2.21.1` plus the RDNA2 tuning branch; `strata-inkling` reports engine version 0.1.67. Upstream `v0.2.22` is newer, but its release notes explicitly keep AMD/Intel/Apple Inkling at 0.1.67 because those engines did not change. The upstream changes to Inkling engine paths since our base are the engine version bump/build-symbol work and a CUDA peer-card fix; no newer HIP kernel change was found. The 0.2.21 release lists an 8.5 GiB VRAM expert budget workaround for RX 6700 XT-class cards; testing that budget here did not improve the measured rates. See [0.2.21](https://github.com/Niko1221/Strata/releases/tag/v0.2.21) and [0.2.22](https://github.com/Niko1221/Strata/releases/tag/v0.2.22).
