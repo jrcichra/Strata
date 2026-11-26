@@ -572,7 +572,72 @@ public:
         for (auto& p : swa_pools_) if (!convert(p)) return false;
         for (auto& p : glob_pools_) if (!convert(p)) return false;
         default_kv_dtype_ = KvDtype::FP8_E4M3;
+        for (auto& c : ckpts_) c.valid = false;
         std::fprintf(stderr, "[ink-hip] converted resident KV pages FP16 -> FP8 before decode\n");
+        return true;
+    }
+
+    // Hybrid serving: switch resident FP8 KV pages back to FP16 before a new request prefills.
+    // Idempotent. On any allocation/host-offload failure it leaves the backend in FP8 and returns false;
+    // the caller then simply runs that prefill in FP8.
+    bool switch_kv_to_fp16(std::string& err) override {
+        if (default_kv_dtype_ != KvDtype::FP8_E4M3) return true;
+        if (mem_info_.is_uma || ep2_active_) {
+            err = "FP8-to-FP16 KV switching is limited to a single discrete GPU";
+            return false;
+        }
+        for (const auto& p : swa_pools_) if (p.host_offload) {
+            err = "[ink-hip] cannot reverse KV format while SWA pages are host-mapped";
+            return false;
+        }
+        for (const auto& p : glob_pools_) if (p.host_offload) {
+            err = "[ink-hip] cannot reverse KV format while global pages are host-mapped";
+            return false;
+        }
+        auto convert = [&](VisitKvPool& p) -> bool {
+            if (p.used_pages == 0) {
+                p.is_fp8 = false;
+                p.cap_pages = 0;
+                ++p.pool_gen;
+                return true;
+            }
+            const size_t n_pages = static_cast<size_t>(p.used_pages);
+            const size_t data_bytes = n_pages * kKvPageTokens * static_cast<size_t>(p.kv_dim) * 2u;
+            GpuBuffer k, v;
+            if (alloc_gpu_buffer(k, data_bytes, false) != hipSuccess ||
+                alloc_gpu_buffer(v, data_bytes, false) != hipSuccess) {
+                free_gpu_buffer(k); free_gpu_buffer(v);
+                err = "[ink-hip] FP8-to-FP16 KV conversion temporary allocation failed";
+                return false;
+            }
+            const int n_tokens = p.used_pages * kKvPageTokens;
+            k3_kv_fp8_to_f16_pages<<<n_tokens, 256, 0, stream_>>>(
+                reinterpret_cast<const uint8_t*>(p.k_pool.dev_ptr),
+                reinterpret_cast<const uint8_t*>(p.v_pool.dev_ptr),
+                reinterpret_cast<const float*>(p.k_scales.dev_ptr),
+                reinterpret_cast<const float*>(p.v_scales.dev_ptr),
+                reinterpret_cast<half_t*>(k.dev_ptr), reinterpret_cast<half_t*>(v.dev_ptr),
+                n_tokens, p.kv_dim);
+            if (!hip_ok(hipGetLastError(), "FP8->FP16 KV conversion launch", err) ||
+                !hip_ok(hipStreamSynchronize(stream_), "FP8->FP16 KV conversion sync", err)) {
+                free_gpu_buffer(k); free_gpu_buffer(v);
+                return false;
+            }
+            free_gpu_buffer(p.k_pool); free_gpu_buffer(p.v_pool);
+            free_gpu_buffer(p.k_scales); free_gpu_buffer(p.v_scales);
+            p.k_pool = k; p.v_pool = v;
+            p.k_scales = GpuBuffer{}; p.v_scales = GpuBuffer{};
+            p.is_fp8 = false;
+            p.cap_pages = p.used_pages;
+            p.host_offload = false;
+            ++p.pool_gen;
+            return true;
+        };
+        for (auto& p : swa_pools_) if (!convert(p)) return false;
+        for (auto& p : glob_pools_) if (!convert(p)) return false;
+        default_kv_dtype_ = KvDtype::FP16;
+        for (auto& c : ckpts_) c.valid = false;  // checkpoints have no dtype tag
+        std::fprintf(stderr, "[ink-hip] converted resident KV pages FP8 -> FP16 before prefill\n");
         return true;
     }
 
@@ -1855,6 +1920,7 @@ public:
         if (hipGetLastError() != hipSuccess) return false;
         ck.seq_len = seq_len;
         ck.dspark_len = std::min(slots_[slot].dspark_len, seq_len);
+        ck.fp8 = fp8;
         ck.valid = true;
         return true;
     }
@@ -1863,6 +1929,7 @@ public:
         if (slot < 0 || slot >= max_slots_ || slot >= static_cast<int>(ckpts_.size()) || !slots_[slot].allocated) return false;
         PromptCkpt& ck = ckpts_[slot];
         if (!ck.valid || ck.seq_len != seq_len || swa_pools_.empty()) return false;
+        if (ck.fp8 != swa_pools_[0].is_fp8) { ck.valid = false; return false; }
         const int n_pools = static_cast<int>(swa_pools_.size());
         const int mpp = swa_pools_[0].max_pages_per_slot;
         if (ck.phys.size() != static_cast<size_t>(n_pools) * mpp) { ck.valid = false; return false; }
@@ -6048,6 +6115,7 @@ private:
     // Prompt checkpoint per slot (see save_prompt_checkpoint)
     struct PromptCkpt {
         bool valid = false;
+        bool fp8 = false;       // dtype of the saved raw KV bytes (hybrid switches dtype between turns)
         int seq_len = 0;
         int dspark_len = 0;
         std::vector<int32_t> phys;  // [n_swa_visits * pages_per_slot] SWA page map when saved, -1 = unmapped

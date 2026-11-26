@@ -215,8 +215,9 @@ The model directories contain 585 S2_K, 2,472 S3_K, and 15 SF4 gate/up expert ma
 use their own shared lookup table.
 
 The separate FP16-prefill-to-FP8-decode benchmark hook is still available for short contexts. Re-measured
-on this exact build at 2K/256 it gives 213.2 and 212.0 prefill tok/s and 58.4 and 58.4 decode tok/s,
-against 196.3 / 55.3 for the default FP8 path. It is not the default because it pre-fills with FP16 KV and
+at 2K/256 with `--draft off` it gives 215.3 and 215.2 prefill tok/s and 34.5 and 34.4 decode tok/s,
+against 196.5 / 34.4 for the FP8 path. The earlier 58.4 tok/s figure was taken while speculation was on
+by default and is not a hybrid-only gain. It changes the output because it pre-fills with FP16 KV and
 then converts resident pages to FP8, which needs both copies resident at once (8K spilled to host), refuses
 UMA/EP2/host-offloaded pools, cannot be combined with `--bench-repeat`, and is not bit-exact: the
 post-conversion teacher-forced check gave KLD 0.001667 with 100% top-1 agreement against the FP8 reference,

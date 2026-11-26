@@ -668,6 +668,15 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             rq.active = false;
             return false;
         }
+        // Hybrid KV: every request starts with FP16 KV for prefill. Failure leaves the backend in FP8
+        // and this particular prefill runs in FP8; never fail the request over a KV format switch.
+        if (cfg.bopts.hybrid_kv) {
+            std::string kv_err;
+            if (!backend.switch_kv_to_fp16(kv_err)) {
+                proto("INFO hybrid_kv: FP8->FP16 failed, prefill in FP8: %s", kv_err.c_str());
+                rq.prompt_ckpt_prefix.clear();
+            }
+        }
         // Prefix reuse check (#6627): prefer full cached_prefix match, else restore prompt-end checkpoint!
         // Because prompt_ckpt_prefix is saved at prompt_len - 1 before generation, BOTH multi-turn follow-ups
         // (even if hidden thinking or stop tokens differed) AND exact repeats reuse the full prior prompt!
@@ -1125,6 +1134,24 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 if (rq.is_solo || !rq.admitted) {
                     const double ppts = step_ms > 0.0 ? (prefill_fed[s] * 1000.0 / step_ms) : 0.0;
                     proto("PP %d %d %.1f %.1f", rq.prefill_pos, rq.prompt_len, rq.prompt_ms, ppts);
+                }
+            }
+        }
+
+        // Hybrid KV: after the final prefill chunk (and after any checkpoint save), switch the
+        // resident KV to FP8 before the first decode step of the request.
+        if (cfg.bopts.hybrid_kv) {
+            bool prefill_done = false;
+            for (int s = 0; s < P; ++s) {
+                if (prefill_fed[s] > 0 && reqs[s].active && reqs[s].prefill_pos >= reqs[s].prompt_len) {
+                    prefill_done = true;
+                    break;
+                }
+            }
+            if (prefill_done) {
+                std::string kv_err;
+                if (!backend.switch_kv_to_fp8(kv_err)) {
+                    proto("INFO hybrid_kv: staying in FP16 for decode: %s", kv_err.c_str());
                 }
             }
         }

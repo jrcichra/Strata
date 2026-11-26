@@ -1613,6 +1613,31 @@ __global__ void __launch_bounds__(256) k3_kv_f16_to_fp8_pages(
     }
 }
 
+// Reverse of k3_kv_f16_to_fp8_pages: restore FP16 KV pages before the next prefill in hybrid serving.
+// Grid: (n_tokens,), Block: 256
+__global__ void __launch_bounds__(256) k3_kv_fp8_to_f16_pages(
+    const uint8_t* __restrict__ k_src,
+    const uint8_t* __restrict__ v_src,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    half_t* __restrict__ k_dst,
+    half_t* __restrict__ v_dst,
+    int n_tokens, int kv_dim) {
+    const int tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    const int tid = threadIdx.x;
+    const float ks = k_scales ? k_scales[tok] : 1.0f;
+    const float vs = v_scales ? v_scales[tok] : 1.0f;
+    const uint8_t* kd = k_src + static_cast<size_t>(tok) * kv_dim;
+    const uint8_t* vd = v_src + static_cast<size_t>(tok) * kv_dim;
+    half_t* kq = k_dst + static_cast<size_t>(tok) * kv_dim;
+    half_t* vq = v_dst + static_cast<size_t>(tok) * kv_dim;
+    for (int i = tid; i < kv_dim; i += 256) {
+        kq[i] = static_cast<half_t>(e4m3fn_to_f32(kd[i]) * ks);
+        vq[i] = static_cast<half_t>(e4m3fn_to_f32(vd[i]) * vs);
+    }
+}
+
 // Store newly computed K/V (head_dim=128, n_kv_heads=8) into paged KV pool (page_size=64).
 // For FP8_KV, computes exact per-token scale = amax / 448.0f (matching SlotKvPages in ink_batch.h!).
 // Grid: (M,), Block: 256

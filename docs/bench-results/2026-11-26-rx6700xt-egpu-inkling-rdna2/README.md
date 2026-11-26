@@ -121,12 +121,10 @@ enabled explicitly with `--draft dspark`. This was decided by measuring, not ass
 - `--spec-check 64` on the 512-token parity prompt, three runs on the current binary: every run reported
   `DIFFERS`, first difference at generated token 24 (plain 68017, speculative 220). Speculation is faster
   but is not lossless on this build, so it cannot be the default when output must be unchanged.
-- The opt-in FP16-prefill/FP8-decode hook is also not bit-exact (KLD 0.001667 versus 0.000000) and needs
-  two KV copies resident at once, so it stays opt-in.
-- The default FP8 KV path on the current build measures prefill 196.4–196.7 tok/s and decode
-  34.4–34.6 tok/s at prompt 2048 / gen 256, three warmed runs, all experts in VRAM. The fresh parity gate
-  on this binary is `n=511 | Mean KLD=0.000000 | Top-1=100.00% | PPL=1101.388`, identical to the
-  baseline reference.
+- The FP16-prefill/FP8-decode path is not bit-exact (KLD 0.001667 versus 0.000000) and needs two KV
+  copies resident at once. It is now the serving default on this setup by explicit choice; see below.
+- The FP8 KV path on the current build measures prefill 196.4–196.7 tok/s and decode 34.4–34.6 tok/s
+  at prompt 2048 / gen 256, three warmed runs, all experts in VRAM, with parity KLD 0.000000.
 
 The 55 tok/s decode figures recorded earlier in this branch came from the speculative path that was on by
 default at the time; they are throughput measurements and are not covered by the lossless guarantee.
@@ -134,6 +132,39 @@ default at the time; they are throughput measurements and are not covered by the
 The serving profile keeps 7.08 GiB VRAM experts plus 1.69 GiB RAM experts: an all-VRAM selfcheck passes
 with 1,710 MiB free, but a 131,072-token KV cache would then spill to host, so the existing split is
 retained for long-context headroom.
+
+## Hybrid KV is now the serving default (2026-11-26)
+
+The profile at `deploy/profile.local-engine.json` (and the installed profile the systemd unit uses) now
+passes `--kv fp16 --hybrid-kv`, `--vram-experts-gb 8.77`, `--ram-experts-gb 0`, and `--draft off`. The
+`--hybrid-kv` flag makes the change per request in the serving loop:
+
+1. Before a request is prepared, the backend converts resident KV pages FP8 -> FP16. A new kernel
+   `k3_kv_fp8_to_f16_pages` dequantizes with the saved per-token scales.
+2. Prefill runs with FP16 KV (the faster prefill path on gfx1031).
+3. After the final prefill chunk, `switch_kv_to_fp8` converts the resident pages before the first decode
+   step, so generation uses FP8 attention.
+
+Conversion failures leave the backend in its current dtype and the request still runs; long contexts
+that would host-offload FP16 KV simply run in FP8. Prompt checkpoints now carry a dtype tag so a
+checkpoint saved in one format is never restored into a pool in the other format.
+
+With all experts in VRAM and `--draft off`, two runs at prompt 2048 / gen 256 measure
+
+| Path | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| FP8 throughout (greedy) | 196.5, 196.6 | 34.4, 34.5 |
+| Hybrid (greedy) | 215.3, 215.2 | 34.5, 34.4 |
+
+The win is in prefill, about 9.5%; with speculation off, decode is unchanged. The earlier 58.4 tok/s
+hybrid figure was recorded while speculation was still on by default and is not a hybrid-only gain.
+
+A live two-request serve smoke test produced the expected sequence of conversions (FP16->FP8 after each
+prefill, FP8->FP16 before the next). On a short prompt, greedy token ids from the hybrid path
+(9, 10, 11, 12, 13, 14, 77863, 81999) matched the FP8 path exactly. This does not erase the measured
+logit difference: the teacher-forced comparison is still KLD 0.001667 with 100% top-1 agreement over
+255 positions, so outputs can differ on other prompts. The hybrid path is a deliberate speed-for-delta
+tradeoff, chosen for this setup at the user's request.
 
 ## Decode composition (B=1, `STRATA_HIP_PROF=2`, prompt 2048)
 

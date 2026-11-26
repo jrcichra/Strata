@@ -32,6 +32,7 @@ struct BackendOpts {
     bool ssd_experts = false;      // first-class GPU+SSD / CPU+SSD direct NVMe streaming mode
     KvDtype kv_dtype = KvDtype::FP16;
     bool kv_dtype_auto = true;   // default lossless FP16; Host KV Offload handles VRAM capacity (#552)
+    bool hybrid_kv = false;        // FP16 prefill -> FP8 decode, per request (single slot only)
     std::string kv_offload = "auto"; // "auto" | "on" | "off" (zero-copy mapped pinned host global KV spill)
     // Off until the B=2..4 speculative parity issue is settled. --draft dspark opts in.
     bool enable_dspark = false;
@@ -127,6 +128,11 @@ public:
     // Optional benchmark/research hook for phase-specific KV experiments.
     virtual bool switch_kv_to_fp8(std::string& err) {
         err = "this backend cannot switch its KV cache to FP8";
+        return false;
+    }
+    // Reverse conversion: back to FP16 KV before the next prefill (hybrid serving).
+    virtual bool switch_kv_to_fp16(std::string& err) {
+        err = "this backend cannot switch its KV cache to FP16";
         return false;
     }
 
