@@ -3102,7 +3102,7 @@ struct GpuExpertDesc {
 // Stage 1: Fused w13 + SITU across all (b, k) active expert selections (ZERO host sync!)
 // Wave-6: LDS-cached sX[D] (4.6 KB shared by all 8 waves) + 1 KB SF4 LUT + zero-switch S2_K/S3_K hot loops!
 // Grid: ((inter + 3) / 4, B * top_k), Block: 256 (8 waves = 4 pairs of (even=gate, odd=up)!)
-__global__ void __launch_bounds__(256) k_moe_direct_w13_situ(
+__global__ void __launch_bounds__(256, 16) k_moe_direct_w13_situ(
     const GpuExpertDesc* __restrict__ exps, // [128]
     const int32_t* __restrict__ topk_ids,   // [B, top_k]
     const half_t* __restrict__ X_f16,       // [B, D]
