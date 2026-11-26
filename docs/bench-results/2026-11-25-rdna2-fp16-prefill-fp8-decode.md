@@ -102,6 +102,19 @@ The serial KLD figures above use one `forward_batch` call per token and FP8 KV, 
 
 On RDNA2, LLVM’s AMDGPU support notes that `v_dot2_f32_bf16` is available starting with gfx11; gfx1031 is gfx10.3, so this direct native BF16 dot path is unavailable here (inference from the target generation). The tested FP16 conversion therefore adds work without a useful speedup. [LLVM AMDGPU change](https://github.com/llvm/llvm-project/commit/aa7eb5723cb4499f35ed1c5455f668ccc078e7c2).
 
+
+### W2 and post-reduction follow-up (2026-11-26)
+
+The model state width is 2,304. The fused post-W2 reducer therefore launches only 9 blocks at its default 256-thread width. More blocks did not improve end-to-end decode, which points to the W2 expert projections or other per-token stages as the larger costs.
+
+| Candidate | 2K prompt / 256 generated, decode tok/s | Decision |
+|---|---:|---|
+| Post-W2 reduce/shortconv: 64 threads, 36 blocks instead of 256 threads, 9 blocks | 53.7, 53.8, 53.9 | No measurable gain |
+| Direct W2: 128 threads / 4 rows per CTA instead of 256 / 8 rows | 53.4, 53.9, 54.0 | Within run noise; retain 256 |
+| One kernel computes all 8 W2 experts, weighted-reduces, and applies shortconv/residual | 37.2, 37.5, 37.5 | Reject; serializing the 8 expert projections loses substantial parallelism |
+
+All candidates were temporary and reverted. The existing parallel per-expert W2 kernels remain the best measured decode route.
+
 ## Upstream version check
 
 The checked-out source is `v0.2.21.1` plus the RDNA2 tuning branch; `strata-inkling` reports engine version 0.1.67. Upstream `v0.2.22` is newer, but its release notes explicitly keep AMD/Intel/Apple Inkling at 0.1.67 because those engines did not change. The upstream changes to Inkling engine paths since our base are the engine version bump/build-symbol work and a CUDA peer-card fix; no newer HIP kernel change was found. The 0.2.21 release lists an 8.5 GiB VRAM expert budget workaround for RX 6700 XT-class cards; testing that budget here did not improve the measured rates. See [0.2.21](https://github.com/Niko1221/Strata/releases/tag/v0.2.21) and [0.2.22](https://github.com/Niko1221/Strata/releases/tag/v0.2.22).
