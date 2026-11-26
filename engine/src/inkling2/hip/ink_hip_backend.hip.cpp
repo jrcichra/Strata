@@ -1516,12 +1516,13 @@ public:
                 // 12 GiB device (982 MiB post-load free) chunk 512 works and chunk 1024 dies with
                 // "[ink-hip] scratch alloc: out of memory". Validate the request against the engine's own scratch
                 // estimate and halve it until it fits in half the free VRAM (the rest absorbs fragmentation).
+                ink2::BatchGeom bg;
+                bg.hidden = c_.hidden; bg.n_head = c_.n_head; bg.head_dim = c_.head_dim; bg.n_kv = c_.n_kv;
+                bg.d_rel = c_.d_rel; bg.rel_extent = c_.rel_extent; bg.inter = c_.inter;
+                bg.n_experts = c_.n_experts; bg.top_k = c_.top_k;
+                const size_t scratch_budget = post_free / 2;  // half of post_free; the rest absorbs fragmentation
                 if (user_chunk > 0) {
-                    ink2::BatchGeom bg;
-                    bg.hidden = c_.hidden; bg.n_head = c_.n_head; bg.head_dim = c_.head_dim; bg.n_kv = c_.n_kv;
-                    bg.d_rel = c_.d_rel; bg.rel_extent = c_.rel_extent; bg.inter = c_.inter;
-                    bg.n_experts = c_.n_experts; bg.top_k = c_.top_k;
-                    const size_t budget = post_free / 2;
+                    const size_t budget = scratch_budget;
                     int allowed = user_chunk;
                     while (allowed > 64 && estimate_batch_scratch_bytes(bg, allowed) > budget) allowed /= 2;
                     if (allowed != user_chunk) {
@@ -1538,17 +1539,28 @@ public:
                         guard_.max_prefill_chunk = user_chunk;
                         std::fprintf(stderr,
                                      "[ink-hip] max_prefill_chunk=%d from STRATA_MAX_PREFILL_CHUNK (post-load free=%.0f MiB; "
-                                     "faster prefill, slower long-context decode; pass --chunk=<same value> so the SWA KV "
-                                     "ring margin grows to match, otherwise forward_batch re-splits at the old span cap)\n",
+                                     "faster prefill, one-off KV pool grow + graph re-capture in long-context decode; pass "
+                                     "--chunk=<same value> so the SWA KV ring margin grows to match, otherwise forward_batch "
+                                     "re-splits at the old span cap)\n",
                                      user_chunk, post_free / 1048576.0);
                     }
                 } else if (tight_vram) {
-                    const int tight_chunk = (post_free < (1536ULL << 20)) ? 256 : 512;
+                    int tight_chunk = (post_free < (1536ULL << 20)) ? 256 : 512;
+                    // The flat 1.5 GiB line was only ever a proxy for "does the batch scratch fit?", so ask the
+                    // engine's own estimate instead of guessing from total free VRAM. A 512-token chunk halves how
+                    // often prefill streams the expert weights: +5.4% prefill at 2048 tokens (177.2 -> 186.8 ppts)
+                    // on a 12 GiB gfx1031 card with 982 MiB post-load free, and logits are bit-identical either way
+                    // (Mean KLD=0.000000, Top-1=100.00% over 511 positions). It looked like a ~10% long-context
+                    // decode regression at prompt 8192, but that was a measurement artifact of a 32-token window:
+                    // the cost is a flat +0.09 s / +0.10 s / +0.11 s at gen 32 / 128 / 512, i.e. one KV pool grow
+                    // plus its graph re-capture (a pool_gen bump), not a per-step tax. Still refuse 512 unless the
+                    // estimate fits in half of post_free, and STRATA_MAX_PREFILL_CHUNK=256 forces the old value.
+                    if (tight_chunk == 256 && estimate_batch_scratch_bytes(bg, 512) <= scratch_budget) tight_chunk = 512;
                     if (guard_.max_prefill_chunk > tight_chunk) {
                         guard_.max_prefill_chunk = tight_chunk;
                         std::fprintf(stderr,
-                                     "[ink-hip] Capped max_prefill_chunk=%d (post-load free=%.0f MiB) to avoid batch scratch VRAM spike\n",
-                                     tight_chunk, post_free / 1048576.0);
+                                     "[ink-hip] Capped max_prefill_chunk=%d (post-load free=%.0f MiB, 512-token scratch=%.0f MiB) to avoid batch scratch VRAM spike\n",
+                                     tight_chunk, post_free / 1048576.0, estimate_batch_scratch_bytes(bg, 512) / 1048576.0);
                     }
                 }
             }
