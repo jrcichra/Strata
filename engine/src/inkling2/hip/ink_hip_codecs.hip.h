@@ -3756,8 +3756,9 @@ __global__ void __launch_bounds__(128) k_moe_build_buckets(
 }
 
 // Fused Grouped MoE Stage 1 (w13 + SITU) across ALL 128 experts in ONE launch!
-// Reads each active expert's weights ONCE for all m_e tokens routed to it (processes up to 8 tokens/tile in registers!).
+// Loads each active expert's weight tiles once per group of up to 16 routed tokens, reusing them across the group.
 // Grid: ((inter + 3) / 4, 128), Block: 256 (8 waves = 4 (gate, up) pairs; uses LDS s_e4m3 LUT for MX8!)
+template<int kTileM = 16>
 __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
     const GpuExpertDesc* __restrict__ exps,  // [128]
     const int32_t* __restrict__ exp_off,     // [129]
@@ -3783,13 +3784,13 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
     __shared__ half_t s_e4m3[256];           //   512 B
     __shared__ uint32_t s_sf4_pair[256];     // 1,024 B
     __shared__ float s_sf4_sc[256];          // 1,024 B
-    __shared__ float s_gu[8 * 8];            //   256 B ([8 waves][8 tokens])
+    __shared__ float s_gu[8 * kTileM];  // 8 waves x kTileM tokens
     // X-slice staging for the multi-token S2_K/S3_K path: one 256-elem slice of X per super-block,
     // staged ONCE for the whole workgroup (8 warps = 8 output rows) and double-buffered, so the next
     // slice's global loads are issued before the current slice is consumed.
     // Without this, every one of the 2*inter output rows re-reads all of X (L1/L2 traffic ~1 TB/chunk).
     // Pure data movement: lane->weight mapping and accumulation order are untouched -> bit-identical.
-    __shared__ alignas(16) half_t sXs[2][8][256];  // 8,192 B
+    __shared__ alignas(16) half_t sXs[2][kTileM][256];  // 16 KiB at kTileM=16
 
     const bool single_tok = (m_e == 1);
     const bool use_sx = (single_tok && D <= 2304 && (D & 7) == 0);
@@ -3933,24 +3934,24 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
             }
         }
         const float sum = wave32_sum(acc);
-        if (lane == 0) s_gu[wave * 8] = sum;
+        if (lane == 0) s_gu[wave * kTileM] = sum;
         __syncthreads();
         if (lane == 0 && (wave & 1) == 0) {
             const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
             const float inv_sq = need_sq ? (1.0f / static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j])) : 1.0f;
             bucket_act[static_cast<size_t>(beg) * inter + j] =
-                static_cast<half_t>(situ_f32(s_gu[wave * 8], s_gu[(wave + 1) * 8], beta, lb) * inv_sq);
+                static_cast<half_t>(situ_f32(s_gu[wave * kTileM], s_gu[(wave + 1) * kTileM], beta, lb) * inv_sq);
         }
         return;
     }
 
-    // Multi-token path (m_e >= 2): stream expert weights ONCE per 8 tokens in low-VGPR register tiles!
-    for (int t0 = 0; t0 < m_e; t0 += 8) {
-        const int tm = (m_e - t0 < 8) ? (m_e - t0) : 8;
-        int toks[8];
+    // Multi-token path (m_e >= 2): stream expert weights ONCE per kTileM tokens in low-VGPR register tiles!
+    for (int t0 = 0; t0 < m_e; t0 += kTileM) {
+        const int tm = (m_e - t0 < kTileM) ? (m_e - t0) : kTileM;
+        int toks[kTileM];
 #pragma unroll
-        for (int t = 0; t < 8; ++t) toks[t] = (t < tm) ? bucket_tok[beg + t0 + t] : 0;
-        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int t = 0; t < kTileM; ++t) toks[t] = (t < tm) ? bucket_tok[beg + t0 + t] : 0;
+        float acc[kTileM] = {};
         // Requires: every 256-wide super-block whole in the row, and no warp able to take the
         // `j >= inter` early return (which would silently skip its share of the staging).
         const bool stage_x = ((D & 255) == 0) && ((inter & 3) == 0);
@@ -3997,7 +3998,7 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
                 const float sc = ue8m0_to_f32(sr[blk]);
                 const uint8_t* wb = wr + (blk << 5);
                 const int k0 = blk << 5;
-                float dt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float dt[kTileM] = {};
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
                     const hv2 h0 = {s_e4m3[wb[q*8+0]], s_e4m3[wb[q*8+1]]};
@@ -4043,9 +4044,11 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
             const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 70;
             const int j0 = lane * 8;
             const int sub = j0 >> 6;
-            if (stage_x && nsb > 0 && sq < tm) {
-                *reinterpret_cast<uint4*>(&sXs[0][sq][so]) =
-                    *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + so);
+            if (stage_x && nsb > 0) {
+                for (int tx = sq; tx < tm; tx += 8) {
+                    *reinterpret_cast<uint4*>(&sXs[0][tx][so]) =
+                        *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[tx]) * D + so);
+                }
             }
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 70;
@@ -4053,9 +4056,11 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
                 const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S2_K, j0);
                 if (stage_x) {
                     __syncthreads();  // slice s is now visible to every warp of the workgroup
-                    if (s + 1 < nsb && sq < tm) {  // prefetch next slice while computing this one
-                        *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][sq][so]) =
-                            *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + ((s + 1) << 8) + so);
+                    if (s + 1 < nsb) {  // prefetch each staged token's next slice while computing this one
+                        for (int tx = sq; tx < tm; tx += 8) {
+                            *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][tx][so]) =
+                                *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[tx]) * D + ((s + 1) << 8) + so);
+                        }
                     }
                     for (int t = 0; t < tm; ++t) {
                         const uint4 xv = *reinterpret_cast<const uint4*>(&sXs[s & 1][t][j0]);
@@ -4079,9 +4084,11 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
             const uint8_t* wr = gu_ptr + static_cast<size_t>(row) * nsb * 102;
             const int j0 = lane * 8;
             const int sub = j0 >> 6;
-            if (stage_x && nsb > 0 && sq < tm) {
-                *reinterpret_cast<uint4*>(&sXs[0][sq][so]) =
-                    *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + so);
+            if (stage_x && nsb > 0) {
+                for (int tx = sq; tx < tm; tx += 8) {
+                    *reinterpret_cast<uint4*>(&sXs[0][tx][so]) =
+                        *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[tx]) * D + so);
+                }
             }
             for (int s = 0; s < nsb; ++s) {
                 const uint8_t* blk = wr + static_cast<size_t>(s) * 102;
@@ -4089,9 +4096,11 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
                 const uint4 wv = decode_sk_8_unscaled_f16(blk + 6, CODE_S3_K, j0);
                 if (stage_x) {
                     __syncthreads();
-                    if (s + 1 < nsb && sq < tm) {
-                        *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][sq][so]) =
-                            *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[sq]) * D + ((s + 1) << 8) + so);
+                    if (s + 1 < nsb) {
+                        for (int tx = sq; tx < tm; tx += 8) {
+                            *reinterpret_cast<uint4*>(&sXs[(s + 1) & 1][tx][so]) =
+                                *reinterpret_cast<const uint4*>(X_f16 + static_cast<size_t>(toks[tx]) * D + ((s + 1) << 8) + so);
+                        }
                     }
                     for (int t = 0; t < tm; ++t) {
                         const uint4 xv = *reinterpret_cast<const uint4*>(&sXs[s & 1][t][j0]);
@@ -4132,15 +4141,15 @@ __global__ void __launch_bounds__(256, 8) k_moe_grouped_w13_situ(
 
         for (int t = 0; t < tm; ++t) {
             const float sum = wave32_sum(acc[t]);
-            if (lane == 0) s_gu[wave * 8 + t] = sum;
+            if (lane == 0) s_gu[wave * kTileM + t] = sum;
         }
         __syncthreads();
         if (lane == 0 && (wave & 1) == 0) {
             const bool need_sq = (desc.dn_code != CODE_SF4 && desc.dn_code != CODE_MX8 && desc.dn_code != CODE_GGUF_RAW);
             const float inv_sq = need_sq ? (1.0f / static_cast<float>(reinterpret_cast<const half_t*>(desc.body)[j])) : 1.0f;
             for (int t = 0; t < tm; ++t) {
-                const float g = s_gu[wave * 8 + t];
-                const float u = s_gu[(wave + 1) * 8 + t];
+                const float g = s_gu[wave * kTileM + t];
+                const float u = s_gu[(wave + 1) * kTileM + t];
                 bucket_act[static_cast<size_t>(beg + t0 + t) * inter + j] = static_cast<half_t>(situ_f32(g, u, beta, lb) * inv_sq);
             }
         }
