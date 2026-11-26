@@ -85,6 +85,23 @@ A one-shot `STRATA_HIP_PROF=2` sample at B=512 measured W13 stage time at 1,369 
 
 The RX 6700 XT is `gfx1031` on kernel 7.3.0-9-generic / HIP 7.15. PCIe was at x16 Gen4, so bus bandwidth is not limiting the all-VRAM case. The driver was left at `power_dpm_force_performance_level=auto` with BOOTUP_DEFAULT profile. A temporary peak profile was slower (about 182 prefill / 53 decode tok/s vs about 187 / 54) and used more power; manual + COMPUTE profile tied auto within noise. Both experiments were restored. During a long run the GPU was busy ~99%, core clock ~2.47–2.56 GHz (reported max 2.725), memory clock 675–1000 MHz, with hotspot briefly 93 C. No persistent driver override is justified by these measurements. No ROCm profiler executable was installed; the built-in HIP stage profiler was used instead.
 
+
+### Decode direct-path trials
+
+At batch one, the runtime uses direct per-route MoE kernels (`B <= 4`); the all-128-expert grouped grid is a prefill path, so compacting its inactive experts would not help decode. The following temporary changes were all reverted:
+
+| Candidate | Decode runs (tok/s) | Numerical check | Result |
+|---|---:|---|---|
+| QKVRG block: 8 rows / 256 threads → 16 rows / 512 threads | 53.5, 53.9, 53.9 | Same row arithmetic | No measurable change |
+| QKVRG: four independent FP32 accumulator chains | 53.2, 53.4, 53.5 | Serial KLD 0.001549, top-1 99.41% | Slower; reject |
+| QKVRG: convert BF16 weights and FP32 activations to FP16, use packed `fdot2` | 52.5, 52.8, 52.7 | Serial KLD 0.001549, top-1 99.41%; baseline serial KLD 0.001664, top-1 99.61% | Slightly lower KLD but worse PPL and speed; reject |
+| Direct W13: 512-thread blocks, twice the rows | 51.1, 50.0, 52.7 | KLD 0.000000 / top-1 100% on batched reference | Occupancy loss; reject |
+| Direct W13: two row-pairs per wave, same 256 threads | 45.7, 45.9, 45.8 | KLD 0.000000 / top-1 100% on batched reference | Serializing work per wave cost 15%; reject |
+
+The serial KLD figures above use one `forward_batch` call per token and FP8 KV, compared against the existing 512-token batched reference. The reference and baseline decode path differ slightly due to FP8 incremental KV updates, so use the baseline serial result as the control. The temporary serial-evaluation hook was removed after the measurements.
+
+On RDNA2, LLVM’s AMDGPU support notes that `v_dot2_f32_bf16` is available starting with gfx11; gfx1031 is gfx10.3, so this direct native BF16 dot path is unavailable here (inference from the target generation). The tested FP16 conversion therefore adds work without a useful speedup. [LLVM AMDGPU change](https://github.com/llvm/llvm-project/commit/aa7eb5723cb4499f35ed1c5455f668ccc078e7c2).
+
 ## Upstream version check
 
 The checked-out source is `v0.2.21.1` plus the RDNA2 tuning branch; `strata-inkling` reports engine version 0.1.67. Upstream `v0.2.22` is newer, but its release notes explicitly keep AMD/Intel/Apple Inkling at 0.1.67 because those engines did not change. The upstream changes to Inkling engine paths since our base are the engine version bump/build-symbol work and a CUDA peer-card fix; no newer HIP kernel change was found. The 0.2.21 release lists an 8.5 GiB VRAM expert budget workaround for RX 6700 XT-class cards; testing that budget here did not improve the measured rates. See [0.2.21](https://github.com/Niko1221/Strata/releases/tag/v0.2.21) and [0.2.22](https://github.com/Niko1221/Strata/releases/tag/v0.2.22).
