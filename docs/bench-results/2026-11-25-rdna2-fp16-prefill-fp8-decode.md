@@ -201,6 +201,9 @@ kernel. It replaces repeated integer-to-half conversions while keeping the same 
 | Pair lookup table only | 189.9, 190.4, 190.6 prefill; 53.5, 53.9, 54.0 decode tok/s | Keep; about 0.3% |
 | Pair table + branchless E4M3 decode | 195.6, 196.3, 196.5 prefill; 55.0, 55.4, 55.3 decode tok/s | Keep; about 3.4% prefill, 2.8% decode |
 
+The decode numbers in this table used the speculative path that was on by default at the time; with the
+current default of `--draft off`, the same build measures 196.4-196.7 prefill and 34.4-34.6 decode tok/s.
+
 The final row was rerun on the exact committed source after removing the temporary diagnostic build:
 `--selfcheck` passes, and the three-run bench is reproduced above. The gain is reproducible across
 runs with a spread of about 0.9 tok/s on prefill and 0.4 tok/s on decode. No quality check was run

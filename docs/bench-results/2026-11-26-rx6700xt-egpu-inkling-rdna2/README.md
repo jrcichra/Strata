@@ -77,7 +77,8 @@ Current binary is `13aa95a90` on the `rdna2-moe-lds-staging` branch.
 | time to first token (2048 tokens) | 17.49 s | 10.44 s | −40.3% |
 | decode | 35.4 tps | 43.4 tps | **+22.6%** |
 
-On the separate greedy protocol used for the latest kernel A/B (prompt 2048 / gen 256, `--draft off`),
+On the separate protocol used for the latest kernel A/B (prompt 2048 / gen 256, speculation enabled by the
+then-default),
 the two changes in `52ba23bfc` moved prefill 189.8 -> 196.3 tok/s (+3.4%) and decode 53.8 -> 55.3
 tok/s (+2.8%).
 
@@ -109,6 +110,28 @@ Per commit, prefill ppts (prompt 2048):
 
 Every shipped change is **bit-identical**: `--kld-eval` against `ref_512_c256.bin` gives
 `n=511 Mean KLD=0.000000 | Top-1=100.00% | PPL=1101.388` before and after.
+
+## Default configuration (2026-11-26)
+
+`enable_dspark` now defaults to false, so plain greedy decoding is the default everywhere. It can still be
+enabled explicitly with `--draft dspark`. This was decided by measuring, not assuming:
+
+- `--spec-check 64` on the 512-token parity prompt, three runs on the current binary: every run reported
+  `DIFFERS`, first difference at generated token 24 (plain 68017, speculative 220). Speculation is faster
+  but is not lossless on this build, so it cannot be the default when output must be unchanged.
+- The opt-in FP16-prefill/FP8-decode hook is also not bit-exact (KLD 0.001667 versus 0.000000) and needs
+  two KV copies resident at once, so it stays opt-in.
+- The default FP8 KV path on the current build measures prefill 196.4–196.7 tok/s and decode
+  34.4–34.6 tok/s at prompt 2048 / gen 256, three warmed runs, all experts in VRAM. The fresh parity gate
+  on this binary is `n=511 | Mean KLD=0.000000 | Top-1=100.00% | PPL=1101.388`, identical to the
+  baseline reference.
+
+The 55 tok/s decode figures recorded earlier in this branch came from the speculative path that was on by
+default at the time; they are throughput measurements and are not covered by the lossless guarantee.
+
+The serving profile keeps 7.08 GiB VRAM experts plus 1.69 GiB RAM experts: an all-VRAM selfcheck passes
+with 1,710 MiB free, but a 131,072-token KV cache would then spill to host, so the existing split is
+retained for long-context headroom.
 
 ## Decode composition (B=1, `STRATA_HIP_PROF=2`, prompt 2048)
 
