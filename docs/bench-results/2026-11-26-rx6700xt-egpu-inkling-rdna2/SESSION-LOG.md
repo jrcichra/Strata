@@ -103,7 +103,12 @@ Local source edit: `ink_hip_backend.hip.cpp` now has two extra profiler marks (`
 - Default: provider `inference` (https://inference.jrcichra.dev/v1), model **`inkling-2-mini-basalt`** (524k context, loaded on demand on the server). Per your instruction, Pi uses the remote server for inference, not the local Strata instance.
 - Verified: `~/.pi/agent/bin/pi --no-session -p "..."` returned a correct answer in about 15 s. Run `~/.pi/agent/bin/pi` (add it to PATH, or use `~/.pi/agent/bin/pi` directly).
 - Quirk: that server answered Python's default User-Agent with HTTP 403; `curl` and Pi are fine.
-- To use the local Strata model from Pi instead, add a provider with `baseUrl: http://127.0.0.1:8080/v1`, model `inkling-2-mini-sq-10`, context 65536, and start `strata launch --preset best`.
+- **Local provider (2026-11-26):** `~/.pi/agent/models.json` now also has a `local` provider at `http://127.0.0.1:8095/v1`
+  with model `inkling-2-mini-sq-10` (131072 context) and the API key from `/etc/strata/inkling.env`. It is marked
+  `reasoning: true`, `supportsReasoningEffort: true`, with `thinkingLevelMap` off/none, minimal, low, medium,
+  high, xhigh, max. Verified against the running server: `reasoning_effort=none` gave 0 reasoning tokens,
+  `xhigh` gave 48 and streamed `reasoning_content`. Pi must be restarted to pick up a new provider; then
+  `/model` -> `local/inkling-2-mini-sq-10`. Start the local server with `sudo systemctl start strata-inkling`.
 
 ## 6. Other setup on this machine
 - Claude Code status line installed from your gist `jrcichra/70640c5a029a33e1f6d47e1d940b73d7` (reviewed first) to `~/.claude/statusline-command.sh`, registered in `~/.claude/settings.json`.
