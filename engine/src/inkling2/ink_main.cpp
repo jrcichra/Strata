@@ -128,7 +128,7 @@ static int cmd_selfcheck(const std::string& model_path, bool force_cpu, bool ver
     return 0;
 }
 
-static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark) {
+static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, int prompt_len, int gen_len, bool force_cpu, bool use_dspark, int bench_repeats) {
     InkModelFile mf;
     std::string err;
     if (!mf.open(model_path, err, false, bopts.dspark_path)) {
@@ -137,6 +137,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     }
     BackendOpts bo = bopts;
     bo.enable_dspark = use_dspark;
+    const char* hybrid_env = std::getenv("STRATA_BENCH_FP8_DECODE");
+    if (bench_repeats > 1 && hybrid_env && std::atoi(hybrid_env) != 0) {
+        fprintf(stderr, "--bench-repeat cannot be combined with STRATA_BENCH_FP8_DECODE (cache dtype changes after conversion)\n");
+        return 2;
+    }
     if (prompt_len + gen_len > bo.max_ctx) {
         bo.max_ctx = prompt_len + gen_len + 16;
     }
@@ -168,92 +173,100 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     std::vector<int32_t> next_tok(P, 100);
     std::vector<float> logits(static_cast<size_t>(P) * V);
     StepBatch batch;
-    double t_pf0 = now_s();
-    const int chunk_run = std::max(1, backend->effective_chunk() > 0 ? backend->effective_chunk() : bo.chunk);
-    for (int p0 = 0; p0 < prompt_len; p0 += chunk_run) {
-        int len = std::min(chunk_run, prompt_len - p0);
-        batch.clear();
-        batch.capture_taps = use_dspark;
-        for (int s = 0; s < P; ++s) {
-            for (int k = 0; k < len; ++k) {
-                bool is_last = (p0 + k == prompt_len - 1);
-                batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
-            }
+    for (int run = 0; run < bench_repeats; ++run) {
+        if (run > 0) {
+            for (int s = 0; s < P; ++s) backend->reset_slot(s);
+            std::fill(next_tok.begin(), next_tok.end(), 100);
         }
-        if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
-            fprintf(stderr, "bench prefill err: %s\n", err.c_str());
-            return 1;
-        }
-    }
-    double pf_s = now_s() - t_pf0;
-    for (int s = 0; s < P; ++s) {
-        const float* lg = logits.data() + static_cast<size_t>(s) * V;
-        int32_t best = 0;
-        for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
-        next_tok[s] = best;
-    }
-
-    double t_dec0 = now_s();
-    if (const char* cv = std::getenv("STRATA_BENCH_FP8_DECODE"); cv && std::atoi(cv) != 0) {
-        if (!backend->switch_kv_to_fp8(err)) {
-            fprintf(stderr, "bench KV conversion err: %s\n", err.c_str());
-            return 1;
-        }
-    }
-    int total_gen = 0;
-    if (use_dspark && P == 1) {
-        int cur_pos = prompt_len;
-        while (total_gen < gen_len && cur_pos < eff_ctx) {
-            const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
-            if (rem >= 2 && cur_pos + 12 < eff_ctx) {
-                int32_t emitted[16]{};
-                int drafted = 0;
-                const int n_emit = backend->dspark_spec_step_greedy(
-                    0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
-                if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
-                if (n_emit > 0) {
-                    next_tok[0] = emitted[n_emit - 1];
-                    cur_pos += n_emit;
-                    total_gen += n_emit;
-                    continue;
-                }
-            }
-            batch.clear();
-            batch.capture_taps = true;
-            batch.push(0, cur_pos++, next_tok[0], true);
-            if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
-                fprintf(stderr, "bench decode err: %s\n", err.c_str());
-                return 1;
-            }
-            int32_t best = 0;
-            for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
-            next_tok[0] = best;
-            ++total_gen;
-        }
-    } else {
-        for (int step = 0; step < gen_len; ++step) {
+        double t_pf0 = now_s();
+        const int chunk_run = std::max(1, backend->effective_chunk() > 0 ? backend->effective_chunk() : bo.chunk);
+        for (int p0 = 0; p0 < prompt_len; p0 += chunk_run) {
+            int len = std::min(chunk_run, prompt_len - p0);
             batch.clear();
             batch.capture_taps = use_dspark;
-            for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
-            if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
-                fprintf(stderr, "bench decode err: %s\n", err.c_str());
+            for (int s = 0; s < P; ++s) {
+                for (int k = 0; k < len; ++k) {
+                    bool is_last = (p0 + k == prompt_len - 1);
+                    batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
+                }
+            }
+            if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
+                fprintf(stderr, "bench prefill err: %s\n", err.c_str());
                 return 1;
             }
-            for (int s = 0; s < P; ++s) {
-                const float* lg = logits.data() + static_cast<size_t>(s) * V;
-                int32_t best = 0;
-                for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
-                next_tok[s] = best;
-                ++total_gen;
+        }
+        double pf_s = now_s() - t_pf0;
+        for (int s = 0; s < P; ++s) {
+            const float* lg = logits.data() + static_cast<size_t>(s) * V;
+            int32_t best = 0;
+            for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
+            next_tok[s] = best;
+        }
+
+        double t_dec0 = now_s();
+        if (const char* cv = std::getenv("STRATA_BENCH_FP8_DECODE"); cv && std::atoi(cv) != 0) {
+            if (!backend->switch_kv_to_fp8(err)) {
+                fprintf(stderr, "bench KV conversion err: %s\n", err.c_str());
+                return 1;
             }
         }
+        int total_gen = 0;
+        if (use_dspark && P == 1) {
+            int cur_pos = prompt_len;
+            while (total_gen < gen_len && cur_pos < eff_ctx) {
+                const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
+                if (rem >= 2 && cur_pos + 12 < eff_ctx) {
+                    int32_t emitted[16]{};
+                    int drafted = 0;
+                    const int n_emit = backend->dspark_spec_step_greedy(
+                        0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
+                    if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
+                    if (n_emit > 0) {
+                        next_tok[0] = emitted[n_emit - 1];
+                        cur_pos += n_emit;
+                        total_gen += n_emit;
+                        continue;
+                    }
+                }
+                batch.clear();
+                batch.capture_taps = true;
+                batch.push(0, cur_pos++, next_tok[0], true);
+                if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+                    fprintf(stderr, "bench decode err: %s\n", err.c_str());
+                    return 1;
+                }
+                int32_t best = 0;
+                for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
+                next_tok[0] = best;
+                ++total_gen;
+            }
+        } else {
+            for (int step = 0; step < gen_len; ++step) {
+                batch.clear();
+                batch.capture_taps = use_dspark;
+                for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
+                if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
+                    fprintf(stderr, "bench decode err: %s\n", err.c_str());
+                    return 1;
+                }
+                for (int s = 0; s < P; ++s) {
+                    const float* lg = logits.data() + static_cast<size_t>(s) * V;
+                    int32_t best = 0;
+                    for (int i = 1; i < V; ++i) if (lg[i] > lg[best]) best = i;
+                    next_tok[s] = best;
+                    ++total_gen;
+                }
+            }
+        }
+        double dec_s = now_s() - t_dec0;
+        double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
+        double tps_agg = total_gen / std::max(dec_s, 1e-9);
+        std::string iter_label;
+        if (bench_repeats > 1) iter_label = "iteration=" + std::to_string(run + 1) + "/" + std::to_string(bench_repeats) + " ";
+        printf("[bench] %sbackend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
+               iter_label.c_str(), backend->backend_name(), source_kind_name(mf.kind), P, bo.gpus, kv_dtype_name(backend->stats().kv_dtype),
+               prompt_len, gen_len, ppts, pf_s, tps_agg, tps_agg / P, dec_s);
     }
-    double dec_s = now_s() - t_dec0;
-    double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
-    double tps_agg = total_gen / std::max(dec_s, 1e-9);
-    printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
-           backend->backend_name(), source_kind_name(mf.kind), P, bo.gpus, kv_dtype_name(backend->stats().kv_dtype),
-           prompt_len, gen_len, ppts, pf_s, tps_agg, tps_agg / P, dec_s);
     return 0;
 }
 
@@ -867,7 +880,7 @@ int main(int argc, char** argv) {
     bool mode_serve = false, mode_bench = false, mode_selfcheck = false, mode_info = false, mode_export = false;
     bool verify_hash = false;
     std::string info_file, export_file, export_dir, kld_ref, dump_ref, prompt_ids_str;
-    int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0;
+    int bench_prompt = 64, bench_gen = 32, bench_repeat = 1, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0;
     float cli_temp = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
@@ -887,6 +900,12 @@ int main(int argc, char** argv) {
             mode_serve = true;
         } else if (a == "--bench") {
             mode_bench = true;
+        } else if (a == "--bench-repeat") {
+            bench_repeat = std::atoi(next().c_str());
+            if (bench_repeat < 1 || bench_repeat > 100) {
+                fprintf(stderr, "--bench-repeat must be 1..100\n");
+                return 2;
+            }
         } else if (a == "--selfcheck") {
             mode_selfcheck = true;
         } else if (a == "--verify-hash") {
@@ -1005,7 +1024,7 @@ int main(int argc, char** argv) {
                    "  --info PATH [--vision VISION] [--dspark PATH]\n"
                    "  --export-tokenizer PATH OUT_DIR\n"
                    "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpu N] [--gpus 1|2] [--kv auto|fp16|fp8|k8v8|k8v4]\n"
-                   "  --bench --native PATH [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
+                   "  --bench --native PATH [--bench-repeat N] [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
                    "  --kld-eval REF.bin --native PATH\n"
                    "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpu N] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--draft auto|dspark|off]\n",
                    INKLING_VERSION);
@@ -1096,7 +1115,7 @@ int main(int argc, char** argv) {
         }
         return cmd_spec_check(cfg.model_path, cfg.bopts, cfg.force_cpu, sc_ids, spec_check_n);
     }
-    if (mode_bench) return cmd_bench(cfg.model_path, cfg.bopts, bench_prompt, bench_gen, cfg.force_cpu, cfg.bopts.enable_dspark);
+    if (mode_bench) return cmd_bench(cfg.model_path, cfg.bopts, bench_prompt, bench_gen, cfg.force_cpu, cfg.bopts.enable_dspark, bench_repeat);
 
     if (cfg.model_path.empty()) {
         fprintf(stderr, "error: --native <model.strata|hf_dir|model.gguf> is required\n");
