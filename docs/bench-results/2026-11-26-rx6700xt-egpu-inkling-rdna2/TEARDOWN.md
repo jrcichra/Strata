@@ -69,6 +69,7 @@ resume the work on different hardware.
 - Serving was never started, so the served configuration (`--draft off`, `--ram-experts-gb 1.69`,
   128 K context) has **no measured decode throughput**. The benchmark numbers in `README.md` are
   `--bench` with all experts in VRAM and speculation on; they are not what the service would deliver.
-- The concurrency sweep (`--parallel 1..8`) had not reported. It is the only experiment here that
-  might have yielded a large throughput win, and its result is not in this folder.
+- The concurrency sweep was stopped during `--parallel 4` once `--parallel 3` showed aggregate throughput
+  collapsing (see the concurrency table in `README.md`). It did **not** yield a win: on this card concurrency
+  is net-negative, so that line of attack is closed rather than unfinished.
 - `--draft off` in the served profile costs the +55% speculation gain measured on this card.

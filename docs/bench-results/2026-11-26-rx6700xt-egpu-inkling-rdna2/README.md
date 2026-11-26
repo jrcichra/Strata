@@ -94,6 +94,23 @@ cancel the gain. It did not, measured across three runs. A spill is a cost to me
   the counters print only under `--spec-check` (`ink_main.cpp:743`), and `STRATA_HIP_DSPARK_PROF` / `STRATA_HIP_TREE_PROF`
   emit nothing in this configuration, so do not reuse any acceptance figure derived from the 2048 numbers.
 
+### Concurrency does not help on this card -- measured, and it contradicts the obvious expectation
+
+Prompt 2048, gen 256. The run was stopped during `--parallel 4` because the trend was already unambiguous
+(`parallel 8` and the long-context cases were never reached):
+
+| parallel | prefill ppts | aggregate decode tps | tps/slot |
+|---:|---:|---:|---:|
+| 1 | 186.7 | **52.5** | 52.5 |
+| 2 | 185.3 | 47.1 | 23.5 |
+| 3 | 36.7 | 10.9 | 3.6 |
+
+Aggregate throughput falls below single-stream at two slots and collapses at three, with prefill dropping 5x.
+One stream already saturates the card's effective bandwidth, so additional slots contribute only KV pressure;
+past ~2 slots the 12 GiB budget is over-subscribed and experts spill into system RAM across the ~3.9 GB/s
+Thunderbolt link. Every run logged `Capped max_prefill_chunk=512 (post-load free=982 MiB, 512-token scratch=391 MiB)`,
+i.e. there was no headroom to begin with. **Do not treat `--parallel` as a throughput lever on this machine.**
+
 ## Not shipped, and why
 
 - **`STRATA_HIP_MOE_I8=1` (SF4 int8 grouped MoE on RDNA2): 2.05× prefill, numerically destroyed.** 381.7/381.8 ppts
