@@ -12,6 +12,9 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
   the clean baseline `a0e388d` was md5 `cd3bc440dff82c9962c682eccf9faecd`. ROCm libs come from the stock
   `0.1.67-linux-x86_64-hip-rx6000` component package (the `enginetest` dir used throughout is only symlinks to it).
 - **Dates:** 2026-11-25 → 2026-11-26.
+- **Current HEAD (2026-11-26):** `52ba23bfc`, which adds branchless E4M3 decode and the S2/S3 W13 pair
+  LUT on top of `2460e04a3`. The OPEN speculative-path item below still applies to this build. Those two
+  changes touch FP8 attention and grouped-W13 weight unpacking only.
 
 ## OPEN -- possible correctness regression in `2460e04a3`; do not treat its "bit-identical" label as settled
 
