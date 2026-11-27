@@ -883,6 +883,148 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
     }
 }
 
+__global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part_fp8(
+    const float* __restrict__ Q,
+    const float* __restrict__ rel_bias,
+    const float* __restrict__ sink_logit,
+    const TreeMetaDev* __restrict__ tmeta,
+    const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ page_table,
+    int max_pages_per_slot,
+    const void* __restrict__ k_pool,
+    const void* __restrict__ v_pool,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    const uint8_t* __restrict__ tree_k,     // [kTreeMaxM, n_kv_heads * 128] E4M3 (k3_kv_paged_store<true> bytes)
+    const uint8_t* __restrict__ tree_v,
+    const float* __restrict__ tree_ks,      // [kTreeMaxM]
+    const float* __restrict__ tree_vs,
+    float* __restrict__ partials,           // [M, n_q_heads, 4, 130]
+    int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
+    constexpr int KSPLITS = 4;
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int qh = blockIdx.x;
+    const int m = blockIdx.y;
+    const int sp = blockIdx.z;
+    if (qh >= n_q_heads || m >= M || sp >= KSPLITS) return;
+
+    __shared__ int s_anc[kTreeMaxM];        // node index of this row's ancestor at depth t (t = 0 .. cur_pos - base_pos)
+    const int base_pos = tmeta->base_pos;
+    const int cur_pos = pos[m];
+    if (threadIdx.x < kTreeMaxM) {
+        int found = -1;
+        const int t = threadIdx.x;
+        const uint32_t tmask = tmeta->mask[m];
+        for (int j = 0; j < M; ++j) {
+            if (((tmask >> j) & 1u) && pos[j] - base_pos == t) found = j;
+        }
+        s_anc[t] = found;
+    }
+    __syncthreads();
+
+    const int d0 = lane * 4;
+    const int kvh = qh / (n_q_heads / n_kv_heads);
+    const int slot = tmeta->slot;
+    const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
+    const int total_kv = cur_pos - k_start + 1;
+    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int sp_beg = k_start + sp * chunk;
+    const int sp_end = min(cur_pos + 1, sp_beg + chunk);
+
+    const float scale = rsqrtf(128.0f);
+    const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+    const float q0 = qv.x * scale, q1 = qv.y * scale, q2 = qv.z * scale, q3 = qv.w * scale;
+
+    float max_l = (sp == 0 && wave == 0 && sink_logit) ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+    float sum_exp = (sp == 0 && wave == 0 && sink_logit) ? 1.0f : 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    const int elems = n_kv_heads * 128;
+    const int kv_off = kvh * 128 + d0;
+    const float* rb_row = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
+
+    for (int kp = sp_beg + wave; kp < sp_end; kp += 8) {
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        if (kp < base_pos) {
+            const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+            const int phys = pt_row[ring_p >> 6];
+            const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+            const size_t base = tok_base * elems + kv_off;
+            const float ks = k_scales ? k_scales[tok_base] : 1.0f;
+            const float vs = v_scales ? v_scales[tok_base] : 1.0f;
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+        } else {
+            const int j = s_anc[kp - base_pos];
+            const size_t tbase = static_cast<size_t>(j) * elems + kv_off;
+            const float ks = tree_ks[j];
+            const float vs = tree_vs[j];
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(tree_k + tbase);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(tree_v + tbase);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+        }
+
+        float sc = wave32_sum(fmaf(q0, k0, fmaf(q1, k1, fmaf(q2, k2, q3 * k3))));
+        const int dist = cur_pos - kp;
+        if (rb_row && dist < max_rel) sc += rb_row[dist];
+
+        const float new_max = fmaxf(max_l, sc);
+        const float alpha = __expf(max_l - new_max);
+        const float beta = __expf(sc - new_max);
+        o0 = fmaf(o0, alpha, beta * v0);
+        o1 = fmaf(o1, alpha, beta * v1);
+        o2 = fmaf(o2, alpha, beta * v2);
+        o3 = fmaf(o3, alpha, beta * v3);
+        sum_exp = fmaf(sum_exp, alpha, beta);
+        max_l = new_max;
+    }
+
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ alignas(16) float4 s_o[8][32];
+    if (lane == 0) { s_max[wave] = max_l; s_sum[wave] = sum_exp; }
+    s_o[wave][lane] = make_float4(o0, o1, o2, o3);
+    __syncthreads();
+
+    if (wave == 0) {
+        float gmax = -1e30f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) gmax = fmaxf(gmax, s_max[w]);
+        float tot_s = 0.0f;
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (s_sum[w] > 0.0f) {
+                const float wt = __expf(s_max[w] - gmax);
+                tot_s += wt * s_sum[w];
+                const float4 p = s_o[w][lane];
+                r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
+                r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
+            }
+        }
+        float* dst = partials + ((static_cast<size_t>(m) * n_q_heads + qh) * KSPLITS + sp) * 130;
+        *reinterpret_cast<float4*>(dst + d0) = make_float4(r0, r1, r2, r3);
+        if (lane == 0) { dst[128] = gmax; dst[129] = tot_s; }
+    }
+}
+
 // =================================================================================================
 // 3. Zero-Logits-D2H Batched Unembed Greedy Argmax (M <= 16 in ONE Read of W_unemb -> 64 B D2H!)
 // =================================================================================================
@@ -1270,6 +1412,34 @@ __global__ void __launch_bounds__(256) k3_kv_commit_tree_all(
         }
     }
 }
+
+// Exact FP8 tree commit: copy the winning nodes' E4M3 bytes + per-token scales (already quantized by k3_kv_paged_store<true>,
+// the plain step's kernel) into the paged pool, so the pool holds the bytes the one-token steps would have written.
+// Grid: (n_acc, n_visits), Block: 256
+__global__ void __launch_bounds__(256) k3_kv_commit_tree_fp8_copy(
+    const KvVisitDesc* __restrict__ visits,
+    const uint8_t* __restrict__ tree_k8, const uint8_t* __restrict__ tree_v8,   // [n_visits, kTreeMaxM, elems]
+    const float* __restrict__ tree_ks, const float* __restrict__ tree_vs,       // [n_visits, kTreeMaxM]
+    WinPath8 wp, int slot, int base_pos, int n_visits, int elems) {
+    const int k = blockIdx.x;
+    const int v = blockIdx.y;
+    if (k >= wp.n_acc || v >= n_visits) return;
+    const KvVisitDesc vd = visits[v];
+    const int p = (vd.swa_ring > 0) ? ((base_pos + k) % vd.swa_ring) : (base_pos + k);
+    const int phys = vd.d_pt[slot * vd.max_pages_per_slot + (p >> 6)];
+    const size_t tok_base = static_cast<size_t>(phys) * 64 + (p & 63);
+    const size_t src_tok = static_cast<size_t>(v) * kTreeMaxM + wp.idx[k];
+    const uint32_t* ks = reinterpret_cast<const uint32_t*>(tree_k8 + src_tok * elems);
+    const uint32_t* vs = reinterpret_cast<const uint32_t*>(tree_v8 + src_tok * elems);
+    uint32_t* kd = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(vd.k_pool) + tok_base * elems);
+    uint32_t* vdst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(vd.v_pool) + tok_base * elems);
+    for (int i = threadIdx.x; i < (elems >> 2); i += 256) { kd[i] = ks[i]; vdst[i] = vs[i]; }
+    if (threadIdx.x == 0) {
+        if (vd.k_scales) vd.k_scales[tok_base] = tree_ks[src_tok];
+        if (vd.v_scales) vd.v_scales[tok_base] = tree_vs[src_tok];
+    }
+}
+
 
 // Gather winning path [0..n_acc-1] of 4 taps [M, D] -> compact [n_acc, D] so launch_dspark_ctx_kernels
 // commits ONLY the winning tokens directly to sl.dspark_k/v/frnn (ZERO wasted ctx compute on rejected nodes!)

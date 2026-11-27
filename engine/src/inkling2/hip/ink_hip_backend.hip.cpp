@@ -2749,6 +2749,7 @@ public:
         (void)hipMemcpyAsync(sc_tok_ids_.dev_ptr, t_tok, M * 4, hipMemcpyHostToDevice, stream_);
         (void)hipMemcpyAsync(sc_img_idx_.dev_ptr, h_img, M * 4, hipMemcpyHostToDevice, stream_);
 
+        tree_fp8_exact_ = is_fp8_tree_exact();
         if (!forward_tree_verify(M, slot, kv_gen_sum, err)) return 0;
         if (dbg_hash_on_) dbg_hash_print("tree", M, h_pos, anchor_pos, t_dep, t_tok, t_par);
         if (tprof) (void)hipEventRecord(tev[2], stream_);
@@ -2807,7 +2808,13 @@ public:
             wp, slot, max_slots_, c_.n_visits, c_.hidden);
 
         // 4b. Commit winning path K/V across ALL 48 visits in 1 launch!
-        if (is_fp8) {
+        if (is_fp8 && tree_fp8_exact_) {
+            k3_kv_commit_tree_fp8_copy<<<dim3(n_acc, c_.n_visits), 256, 0, stream_>>>(
+                reinterpret_cast<const KvVisitDesc*>(d_tree_kv_descs_.dev_ptr),
+                reinterpret_cast<const uint8_t*>(d_tree_k8_.dev_ptr), reinterpret_cast<const uint8_t*>(d_tree_v8_.dev_ptr),
+                reinterpret_cast<const float*>(d_tree_ks_.dev_ptr), reinterpret_cast<const float*>(d_tree_vs_.dev_ptr),
+                wp, slot, anchor_pos, c_.n_visits, trunk_kvd);
+        } else if (is_fp8) {
             k3_kv_commit_tree_all<true><<<dim3(n_acc, c_.n_visits), 256, 0, stream_>>>(
                 reinterpret_cast<const KvVisitDesc*>(d_tree_kv_descs_.dev_ptr),
                 reinterpret_cast<const half_t*>(d_tree_k_.dev_ptr),
@@ -3330,6 +3337,11 @@ private:
             if (it == model.m.trunk.end() || it->second.fmt != F_Q8ROW || !is_large_2d_matmul(pre + t, it->second)) return false;
         }
         return true;
+    }
+    // STRATA_INK_TREE_FP8_EXACT=0 restores the old (non-exact) FP8 tree verify.
+    bool is_fp8_tree_exact() const {
+        static const bool off = [] { const char* e = std::getenv("STRATA_INK_TREE_FP8_EXACT"); return e && e[0] == '0'; }();
+        return default_kv_dtype_ == KvDtype::FP8_E4M3 && exact_verify_enabled_ && !off;
     }
     bool has_qkvrg(int ip) const { return trunk_qkvrg_[ip].dev_ptr != nullptr || (ip < (int)trunk_qkvrg_q8_.size() && trunk_qkvrg_q8_[ip].q.dev_ptr != nullptr); }
     DW qkvrg_w(int ip) const {
@@ -5411,8 +5423,20 @@ private:
             !al(d_tree_arg_v_, static_cast<size_t>(kTreeMaxM) * 256 * sizeof(float)) ||
             !al(d_tree_arg_i_, static_cast<size_t>(kTreeMaxM) * 256 * sizeof(int32_t)) ||
             !al(d_tree_arg_out_, static_cast<size_t>(kTreeMaxM) * sizeof(int32_t)) ||
-            !al(d_tree_kv_descs_, nv * sizeof(KvVisitDesc))) {
+            !al(d_tree_kv_descs_, nv * sizeof(KvVisitDesc)) ||
+            !al(d_tree_k8_, nv * kTreeMaxM * kv_dim) ||
+            !al(d_tree_v8_, nv * kTreeMaxM * kv_dim) ||
+            !al(d_tree_ks_, nv * kTreeMaxM * sizeof(float)) ||
+            !al(d_tree_vs_, nv * kTreeMaxM * sizeof(float)) ||
+            !al(d_tree_iota_, kTreeMaxM * sizeof(int32_t)) ||
+            !al(d_tree_zero_, kTreeMaxM * sizeof(int32_t))) {
             return false;
+        }
+        {
+            int32_t io[kTreeMaxM], zr[kTreeMaxM];
+            for (int i = 0; i < kTreeMaxM; ++i) { io[i] = i; zr[i] = 0; }
+            if (!hip_ok(hipMemcpy(d_tree_iota_.dev_ptr, io, sizeof(io), hipMemcpyHostToDevice), "tree iota", err) ||
+                !hip_ok(hipMemcpy(d_tree_zero_.dev_ptr, zr, sizeof(zr), hipMemcpyHostToDevice), "tree zero", err)) return false;
         }
         for (int k = 0; k < 4; ++k) {
             if (!al(d_tree_taps_win_[k], 8u * static_cast<size_t>(D) * sizeof(float))) return false;
@@ -5741,6 +5765,24 @@ private:
             const int r_sc_stride = (trunk_f32_.at(r_sc_k).bytes >= static_cast<size_t>(c_.n_head) * c_.d_rel * 4) ? c_.d_rel : 0;
             half_t* tk_v = reinterpret_cast<half_t*>(d_tree_k_.dev_ptr) + visit * kv_trec_st;
             half_t* tv_v = reinterpret_cast<half_t*>(d_tree_v_.dev_ptr) + visit * kv_trec_st;
+            // FP8 KV + exact rows: the plain step's own kernels (norm_clip_fused, relpos_bias_proj, paged_store<FP8>) so every
+            // tree node's Q/R/K/V and its E4M3 bytes + scales are what the one-token step at that position computes
+            const bool fp8_exact = is_fp8 && exact_rows_ && tree_fp8_exact_ && c_.head_dim == 128 && c_.d_rel <= 32;
+            uint8_t* tk8 = reinterpret_cast<uint8_t*>(d_tree_k8_.dev_ptr) + visit * kv_trec_st;
+            uint8_t* tv8 = reinterpret_cast<uint8_t*>(d_tree_v8_.dev_ptr) + visit * kv_trec_st;
+            float* tks = reinterpret_cast<float*>(d_tree_ks_.dev_ptr) + static_cast<size_t>(visit) * kTreeMaxM;
+            float* tvs = reinterpret_cast<float*>(d_tree_vs_.dev_ptr) + static_cast<size_t>(visit) * kTreeMaxM;
+            if (fp8_exact) {
+                k2_qrkv_norm_clip_fused<<<dim3(2 * c_.n_head + 2 * c_.n_kv, B), 128, 0, stream_>>>(
+                    q, f32_ptr(q_sc_k), q_sc_stride, r_raw, f32_ptr(r_sc_k), r_sc_stride, k_cv, v_cv,
+                    is_swa ? nullptr : pos_dev, c_.qk_l2_clip, c_.rel_l2_clip, c_.rms_eps,
+                    B, c_.n_head, c_.n_kv, c_.head_dim, c_.d_rel);
+                k3_kv_paged_store<true><<<B, 256, 0, stream_>>>(
+                    k_cv, v_cv, reinterpret_cast<const int32_t*>(d_tree_zero_.dev_ptr), reinterpret_cast<const int32_t*>(d_tree_iota_.dev_ptr),
+                    reinterpret_cast<const int32_t*>(d_tree_zero_.dev_ptr), 1, tk8, tv8, tks, tvs, B, c_.n_kv, c_.head_dim, 0);
+                k_relpos_bias_proj<<<dim3(c_.n_head, B), 256, 0, stream_>>>(
+                    r_raw, f32_ptr(p + ".attn.rel_logits_proj.proj"), pos_dev, rbias, B, c_.n_head, c_.d_rel, c_.rel_extent);
+            } else
             k2_qrkv_treestore_relpos_fused<<<dim3(2 * c_.n_head + 2 * c_.n_kv, B), 128, 0, stream_>>>(
                 q, f32_ptr(q_sc_k), q_sc_stride,
                 r_raw, f32_ptr(r_sc_k), r_sc_stride,
@@ -5754,7 +5796,17 @@ private:
             VisitKvPool& kvp = is_swa ? swa_pools_[kv_slot] : glob_pools_[kv_slot];
             const int swa_w = is_swa ? c_.swa_win : 0;
             const int swa_r = is_swa ? swa_ring_ : 0;
-            if (exact_rows_ && !is_fp8) {
+            if (fp8_exact) {
+                float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
+                k3_flash_tree_splitkv_part_fp8<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                    q, rbias, sinks, d_tm, pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                    tk8, tv8, tks, tvs,
+                    sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head);
+            } else if (exact_rows_ && !is_fp8) {
                 // #6671: the arithmetic of the one-token step (split-KV, four chunks), so tree row m = step at that position
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
                 k3_flash_tree_splitkv_part<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
@@ -6124,6 +6176,8 @@ private:
         free_gpu_buffer(d_beam_st_a_); free_gpu_buffer(d_beam_st_b_); free_gpu_buffer(d_beam_lat_);
         free_gpu_buffer(d_beam_corr_); free_gpu_buffer(d_beam_scores_);
         free_gpu_buffer(d_tree_meta_); free_gpu_buffer(d_tree_k_); free_gpu_buffer(d_tree_v_);
+        free_gpu_buffer(d_tree_k8_); free_gpu_buffer(d_tree_v8_); free_gpu_buffer(d_tree_ks_); free_gpu_buffer(d_tree_vs_);
+        free_gpu_buffer(d_tree_iota_); free_gpu_buffer(d_tree_zero_);
         free_gpu_buffer(d_tree_rec_k_); free_gpu_buffer(d_tree_rec_v_);
         free_gpu_buffer(d_tree_rec_attn_); free_gpu_buffer(d_tree_rec_mlp_);
         free_gpu_buffer(d_tree_h_f16_); free_gpu_buffer(d_tree_arg_v_);
@@ -6356,6 +6410,8 @@ private:
     GpuBuffer d_beam_pool_, d_beam_cnt_, d_beam_tok_, d_beam_node_, d_beam_lp_;
     GpuBuffer d_beam_st_a_, d_beam_st_b_, d_beam_lat_, d_beam_corr_, d_beam_scores_;
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
+    GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
+    bool tree_fp8_exact_ = false;
     GpuBuffer d_tree_rec_k_, d_tree_rec_v_, d_tree_rec_attn_, d_tree_rec_mlp_;
     GpuBuffer d_tree_h_f16_, d_tree_arg_v_, d_tree_arg_i_, d_tree_arg_out_, d_tree_kv_descs_;
     GpuBuffer d_tree_taps_win_[4];
