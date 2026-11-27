@@ -19,6 +19,49 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
   LUT on top of `2460e04a3`; `427074dd4` makes greedy decoding the default; `6a6f3907f` adds serving-side hybrid KV. The OPEN speculative-path item below still applies to this build. Those two
   changes touch FP8 attention and grouped-W13 weight unpacking only.
 
+## 2026-11-27 (evening): serving moved to llama.cpp + GSQ-RCO Q2_K_XL (read this first)
+
+The pi server on :8095 is now `llama-inkling.service` (llama.cpp `6d8a888`, built against TheRock 7.13) running
+ISTA-DASLab's [Inkling-2-Mini-GSQ-RCO-Q2_K_XL](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF)
+(98.0% of the base model's AIME25 / GPQA-D / LCB v6 average per ISTA) with their DSpark Q8_0 drafter and vision
+(encoder on the CPU), 100K context, q8_0 KV. `strata-inkling.service` (this fork's engine, section below) stays
+installed and disabled for rollback: `sudo systemctl disable --now llama-inkling && sudo systemctl enable --now strata-inkling`,
+and set pi's `contextWindow` back to 131072.
+
+Same box, same requests:
+
+| | Strata fork (SQ-10, 128K) | llama.cpp Q2_K_XL + DSpark (100K) |
+|---|---:|---:|
+| prefill, 2K prompt | 227 tok/s | 730 tok/s (llama-bench, ub 512) |
+| prefill, 15K prompt | not run (213 at 8K, 180 at 32K) | 451 tok/s (ub 256) |
+| prefill, ~117K prompt | 103.5 tok/s (130K) | 287 tok/s (no drafter, ub 512) |
+| decode, 15K prompt | not run (36.2 at 8K, 32.5 at 32K, drafter off) | 43.4 tok/s |
+| HTTP decode code / chat / edit (pi key) | 46.4 / 41.7 / 45.5 | 54.0 / 38.7 / 52.5 |
+| TTFT, short prompts | 0.5-0.8 s | 0.34-0.50 s |
+| tool call / red-image check | pass | pass (image 1.3 s) |
+
+What it took on this box:
+- **HIP runtime:** Ubuntu's `libamdhip64` (10.0 packages) segfaults inside the first `hipMemsetAsync` / `hipMemcpy`
+  of both llama.cpp and RedStrata's strata-poly; TheRock 7.13's runtime reports only half the system RAM as VRAM
+  (7684 of 12272 MiB). The runtime bundled with the Strata 0.1.67 engine (copied into
+  `/mnt/win/llm-temp/engines/inkling2-rdna2-local`) reports all 12 GiB and works, so the unit puts that first on
+  `LD_LIBRARY_PATH` and TheRock's hipBLAS / rocBLAS after it.
+- **`-lm none`:** the default mmap load over the NTFS (ntfs-3g FUSE) mount crawls for 10+ minutes; plain reads load in ~70 s.
+- **Drafter fit:** DSpark attends over the target context, so its compute buffer grows with `-c`. It fits at
+  102400 with `-ub 256 -b 256 -ctkd q4_0 -ctvd q4_0 --spec-draft-n-ubatch 64`; 108K and 120K were 448 / 498 MiB
+  short, 128K without the drafter fits (decode 27 tok/s). The draft KV type only changes acceptance, not output.
+
+Measured and rejected the same day: RedStrata `strata-poly` on Q2_K_XL (2K prefill 20 tok/s, decode 12.6: its
+design keeps experts in system RAM, and TheRock's VRAM cap left 2432 of 3072 experts on the GPU); stock Strata
+0.2.23 with the DFlash 2 drafter on SQ-10 (2K 143 / 31.6, 32K 94.6 / 23.8 tok/s, below this fork's 227 / 60.7 and
+180 / 32.5); project-maya's only Inkling quant is 16.4 GB.
+
+Rebuild after a reboot: `deploy/restore.sh` installs `llama-inkling.service` by default (`SERVER=strata` for the
+old engine). Build recipe: `cmake -B build-tr -G Ninja -DGGML_HIP=ON -DGPU_TARGETS=gfx1031
+-DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=$R` with `R=/mnt/win/llm-temp/therock/_rocm_sdk_devel`
+(TheRock 7.13.0a20260421 gfx103X-dgpu wheels unpacked side by side as `_rocm_sdk_{core,devel,libraries_gfx103X_dgpu}`
+so the devel tree's relative symlinks resolve).
+
 ## 2026-11-27: 128K context fits on the card; speculation is lossless again (read this first)
 
 This section supersedes the **OPEN** item and the **hybrid KV is the serving default** section below; both

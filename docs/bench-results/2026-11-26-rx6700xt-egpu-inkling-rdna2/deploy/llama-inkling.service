@@ -1,0 +1,36 @@
+[Unit]
+Description=llama.cpp server: Inkling 2 Mini GSQ-RCO Q2_K_XL + DSpark drafter, 100K ctx (RX 6700 XT, HIP)
+Documentation=https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF
+After=network-online.target
+Wants=network-online.target
+Conflicts=strata-inkling.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+# Strata's bundled HIP runtime (sees all 12 GiB; Ubuntu's segfaults, TheRock's caps VRAM at half of RAM) + TheRock hipBLAS/rocBLAS
+Environment=LD_LIBRARY_PATH=/mnt/win/llm-temp/engines/inkling2-rdna2-local:/mnt/win/llm-temp/therock/_rocm_sdk_devel/lib
+# LLAMA_API_KEY (same key as Strata's STRATA_API_KEY, so pi needs no change)
+EnvironmentFile=/etc/strata/llama.env
+# -lm none: mmap over the NTFS (FUSE) mount stalls for many minutes.
+# -ub/-b 256, q4_0 draft KV, draft ubatch 64: what lets the drafter fit next to 100K of q8_0 KV.
+ExecStart=/mnt/win/llm-temp/llama.cpp/build-tr/bin/llama-server \
+    -m /mnt/win/llm-temp/gguf/gsq-rco/Inkling-2-Mini-GSQ-RCO-Q2_K_XL.gguf -lm none -ngl 99 -fa on \
+    -c 102400 -ctk q8_0 -ctv q8_0 -ub 256 -b 256 -np 1 \
+    -md /mnt/win/llm-temp/gguf/gsq-rco/dspark-Inkling-2-Mini-Q8_0.gguf -ngld 99 \
+    -ctkd q4_0 -ctvd q4_0 --spec-draft-n-ubatch 64 \
+    --mmproj /mnt/win/llm-temp/gguf/gsq-rco/mmproj-Inkling-2-Mini-BF16.gguf --no-mmproj-offload \
+    --alias inkling-2-mini-q2_k_xl --host 0.0.0.0 --port 8095
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+SupplementaryGroups=video render
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

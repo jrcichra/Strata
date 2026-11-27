@@ -56,6 +56,30 @@ else
   say "  keeping existing $ENVF"
 fi
 
+# SERVER=llama (default since 2026-11-27): llama.cpp + GSQ-RCO Q2_K_XL + DSpark drafter, 100K ctx.
+# SERVER=strata: the old Strata fork engine (rollback).
+SERVER=${SERVER:-llama}
+if [ "$SERVER" = llama ]; then
+  LB=/mnt/win/llm-temp/llama.cpp/build-tr/bin/llama-server
+  G=/mnt/win/llm-temp/gguf/gsq-rco
+  for f in "$LB" "$G/Inkling-2-Mini-GSQ-RCO-Q2_K_XL.gguf" "$G/dspark-Inkling-2-Mini-Q8_0.gguf" \
+           "$G/mmproj-Inkling-2-Mini-BF16.gguf" /mnt/win/llm-temp/therock/_rocm_sdk_devel/lib/libhipblas.so.3; do
+    [ -e "$f" ] || { say "  MISSING: $f  (see the README section on llama.cpp, 2026-11-27)"; exit 1; }
+  done
+  sudo sh -c "sed -n 's/^STRATA_API_KEY=/LLAMA_API_KEY=/p' $ENVF > /etc/strata/llama.env; chmod 600 /etc/strata/llama.env"
+  sudo tee /etc/systemd/system/llama-inkling.service >/dev/null < "$DOC/deploy/llama-inkling.service"
+  sudo tee "$UNIT" >/dev/null < "$DOC/deploy/strata-inkling.service"
+  sudo systemctl daemon-reload
+  sudo systemctl disable strata-inkling >/dev/null 2>&1 || true
+  sudo systemctl enable llama-inkling >/dev/null 2>&1
+  say "  llama-inkling installed and enabled at boot (strata-inkling installed, disabled)"
+  say "  pi: set providers.local.models[0].contextWindow to 102400 in ~/.pi/agent/models.json"
+  say ""
+  say "Start: sudo systemctl start llama-inkling && journalctl -u llama-inkling -f   (~70 s load)"
+  say "Rollback: SERVER=strata $0, then sudo systemctl start strata-inkling"
+  exit 0
+fi
+
 sudo tee "$UNIT" >/dev/null < "$DOC/deploy/strata-inkling.service"
 sudo systemctl daemon-reload
 sudo systemctl enable strata-inkling >/dev/null 2>&1
