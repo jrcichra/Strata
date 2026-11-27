@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -2148,7 +2149,12 @@ public:
             }
             return true;
         }
+        const auto fb_t0 = std::chrono::steady_clock::now();
         const bool fb_ok = forward_batch_chunk(batch, logits_out, taps_out, err);
+        if (fb_ok && B_tot == 1) {   // measured one-token step: the yardstick the tree gate compares against
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fb_t0).count();
+            ema_t1_ms_ = (ema_t1_ms_ <= 0.0) ? ms : 0.9 * ema_t1_ms_ + 0.1 * ms;
+        }
         if (fb_ok && dbg_hash_on_) dbg_hash_print("fwd", B_tot, batch.pos.data(), -1, nullptr, batch.token_ids.data(), nullptr);
         return fb_ok;
     }
@@ -2400,6 +2406,7 @@ public:
         if (no_tree) return 0;
         auto& sl = slots_[slot];
         if (anchor_pos < 1 || sl.dspark_len < anchor_pos || anchor_pos + kTreeMaxM >= sl.max_ctx) return 0;
+        const auto spec_t0 = std::chrono::steady_clock::now();
         if (c_.head_dim > 128 || c_.d_rel > 16 || (c_.rel_extent & 3) != 0) return 0;
         if (static_cast<int>(dspark_qkv_.size()) != dspark_cfg_.n_layers ||
             dspark_qkv_[0].dev_ptr == nullptr || dspark_gu_[0].dev_ptr == nullptr) return 0;
@@ -2651,13 +2658,17 @@ public:
             // Sparse-MoE Bayes-optimal M* normalized to M=1 (1.0x) plain decode!
             static const int kCandMs[] = {3, 4, 5, 6, 8, 10, 12};
             int best_M = 1;
-            double best_score = 0.88;  // reject flat high-entropy chat probes while never starving code/math!
+            // A tree must beat the one-token step it replaces. Costs are the measured wall time of this card's tree steps (draft +
+            // verify + commit) over its measured one-token step; the analytic model only seeds sizes not tried yet.
+            static const double min_gain = [] { const char* e = std::getenv("STRATA_INK_TREE_MIN_GAIN"); return e ? std::atof(e) : 1.0; }();
+            double best_score = min_gain;
             double best_cost = 1.0;
             for (int cm : kCandMs) {
                 if (cm > n_sel) continue;
                 double exp_acc = 1.0;
                 for (int i = 1; i < cm; ++i) exp_acc += static_cast<double>(t_prob[i]);
-                const double cost = 1.0 + 4.2 * (1.0 - std::pow(15.0 / 16.0, static_cast<double>(cm)));
+                double cost = 1.0 + 4.2 * (1.0 - std::pow(15.0 / 16.0, static_cast<double>(cm)));
+                if (ema_t1_ms_ > 0.0 && ema_tree_ms_[cm] > 0.0) cost = ema_tree_ms_[cm] / ema_t1_ms_;
                 const double score = exp_acc / cost;
                 if (score > best_score) {
                     best_score = score;
@@ -2896,9 +2907,12 @@ public:
 
         // Realized-gain adaptive cooldown: protect high-entropy chat prompts while never starving code/math!
         if (M >= 2) {
-            const float realized = static_cast<float>(n_acc) / static_cast<float>(chosen_cost_ratio);
+            const double tree_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - spec_t0).count();
+            ema_tree_ms_[M] = (ema_tree_ms_[M] <= 0.0) ? tree_ms : 0.7 * ema_tree_ms_[M] + 0.3 * tree_ms;
+            const float realized = (ema_t1_ms_ > 0.0) ? static_cast<float>(n_acc * ema_t1_ms_ / tree_ms)
+                                                      : static_cast<float>(n_acc) / static_cast<float>(chosen_cost_ratio);
             sl.tree_ema_gain = 0.80f * sl.tree_ema_gain + 0.20f * realized;
-            if (sl.tree_ema_gain < 0.82f) {
+            if (sl.tree_ema_gain < 0.95f) {
                 sl.tree_cool_rem = 12;
             }
         }
@@ -6412,6 +6426,8 @@ private:
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
     GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
     bool tree_fp8_exact_ = false;
+    double ema_t1_ms_ = 0.0;
+    double ema_tree_ms_[kTreeMaxM + 1] = {};
     GpuBuffer d_tree_rec_k_, d_tree_rec_v_, d_tree_rec_attn_, d_tree_rec_mlp_;
     GpuBuffer d_tree_h_f16_, d_tree_arg_v_, d_tree_arg_i_, d_tree_arg_out_, d_tree_kv_descs_;
     GpuBuffer d_tree_taps_win_[4];
