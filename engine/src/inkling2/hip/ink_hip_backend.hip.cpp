@@ -4738,6 +4738,43 @@ private:
                         kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
                         aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 }
+            } else if (is_contiguous_single_slot && rdna2_tiled_attn() && (mem_info_.gen == AmdGen::Rdna2 || mem_info_.gen == AmdGen::Unknown) &&
+                       c_.head_dim == 128 && c_.n_head % c_.n_kv == 0 && c_.n_head / c_.n_kv <= 8) {
+                const int BQ = 64 / (c_.n_head / c_.n_kv);
+                const dim3 tgrid(c_.n_kv, (B + BQ - 1) / BQ);
+                if (is_fp8) {
+                    k3_flash_prefill_tiled_rdna2<true><<<tgrid, 256, 0, stream_>>>(
+                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                } else {
+                    k3_flash_prefill_tiled_rdna2<false><<<tgrid, 256, 0, stream_>>>(
+                        q, gatea, rbias, sinks, batch.slot_ids[0], batch.pos[0],
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                }
+                if (std::getenv("STRATA_INK_TILED_CHECK") && is_fp8) {
+                    static float* ref = nullptr;
+                    if (!ref) (void)hipMalloc(&ref, static_cast<size_t>(1024) * c_.n_head * 128 * 4);
+                    k3_flash_swa_gqa_splitkv<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
+                        q, gatea, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        ref, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
+                    const size_t n = static_cast<size_t>(B) * c_.n_head * 128;
+                    std::vector<float> a(n), r(n);
+                    (void)hipStreamSynchronize(stream_);
+                    (void)hipMemcpy(a.data(), aout, n * 4, hipMemcpyDeviceToHost);
+                    (void)hipMemcpy(r.data(), ref, n * 4, hipMemcpyDeviceToHost);
+                    double mx = 0, mref = 0; size_t at = 0;
+                    for (size_t i = 0; i < n; ++i) { const double d = std::fabs(a[i] - r[i]); if (d > mx) { mx = d; at = i; } mref = std::max(mref, (double)std::fabs(r[i])); }
+                    std::fprintf(stderr, "[tiled-check] visit=%d swa=%d B=%d pos0=%d maxdiff=%.3g (ref max %.3g) at m=%zu h=%zu d=%zu tiled=%.5g ref=%.5g\n",
+                                 visit, swa_w, B, batch.pos[0], mx, mref, at / (c_.n_head * 128), (at / 128) % c_.n_head, at % 128, a[at], r[at]);
+                }
             } else if (mem_info_.gen == AmdGen::Rdna2 || mem_info_.gen == AmdGen::Unknown) {
                 // RDNA2 (no matrix cores): 4-wave KV-split attention (same design as the B<=8 path)
                 // instead of the sequential-loop generic kernel -- each (qh, m) pair runs 4 waves over KV.
@@ -6721,6 +6758,10 @@ private:
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
     GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
     bool tree_fp8_exact_ = false;
+    static bool rdna2_tiled_attn() {
+        static const bool on = [] { const char* e = std::getenv("STRATA_INK_TILED_ATTN"); return !(e && e[0] == '0'); }();
+        return on;
+    }
     struct DsHostCopy { GpuBuffer* b; std::vector<uint8_t> h; };
     std::vector<DsHostCopy> ds_host_;
     bool ds_evicted_ = false;

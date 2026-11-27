@@ -1878,6 +1878,189 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa(
     *reinterpret_cast<float4*>(O_out + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0) = make_float4(o0, o1, o2, o3);
 }
 
+// RDNA2 tiled prefill attention (no matrix cores): one block = one KV head x all G query heads sharing it x BQ queries
+// (R = G*BQ <= 64 rows), streaming 32-key K/V tiles of the paged pool through LDS once per block instead of once per
+// (query, head). Exact FP32 math; only the summation order differs from the per-row kernel.
+// Grid (n_kv_heads, ceil(M / BQ)), Block 256 (8 waves; wave w owns rows w, w+8, ...; lane = key within the tile for
+// scores, lane = 4 output dims for P*V). Queries are one slot's contiguous positions pos0 .. pos0+M-1.
+__device__ __forceinline__ float wave32_max_f(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 32));
+    return v;
+}
+__device__ __forceinline__ float wave32_sum_f(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+    return v;
+}
+template <bool FP8_KV>
+__global__ void __launch_bounds__(256) k3_flash_prefill_tiled_rdna2(
+    const float* __restrict__ Q, const float* __restrict__ gate_attn, const float* __restrict__ rel_bias,
+    const float* __restrict__ sink_logit, int slot, int pos0,
+    const int32_t* __restrict__ page_table, int max_pages_per_slot,
+    const void* __restrict__ k_pool, const void* __restrict__ v_pool,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales,
+    float* __restrict__ O_out, int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
+    constexpr int R = 64, BK = 32, D = 128, KB = FP8_KV ? 1 : 2;
+    __shared__ alignas(16) float sQ[R][D];
+    __shared__ alignas(16) uint8_t sK[BK * D * KB];
+    __shared__ alignas(16) uint8_t sV[BK * D * KB];
+    __shared__ float sKs[BK], sVs[BK];
+    __shared__ float sP[R][BK + 1];
+    const int G = n_q_heads / n_kv_heads;
+    const int BQ = R / G;
+    const int kvh = blockIdx.x;
+    const int q0 = blockIdx.y * BQ;
+    const int nq = min(BQ, M - q0);
+    if (nq <= 0) return;
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+    const float scale = rsqrtf(128.0f);
+    const int elems = n_kv_heads * D;
+    const int32_t* pt_row = page_table + static_cast<size_t>(slot) * max_pages_per_slot;
+
+    for (int idx = tid; idx < R * D; idx += 256) {
+        const int r = idx / D, d = idx % D;
+        const int g = r / BQ, qi = r % BQ;
+        float v = 0.0f;
+        if (g < G && qi < nq) v = Q[(static_cast<size_t>(q0 + qi) * n_q_heads + kvh * G + g) * D + d] * scale;
+        sQ[r][d] = v;
+    }
+    float m_i[8], l_i[8], o[8][4];
+    int qp_i[8], ks_i[8];
+    bool ok_i[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = wave + 8 * i, g = r / BQ, qi = r % BQ;
+        ok_i[i] = (g < G && qi < nq);
+        const int m = q0 + qi, qh = kvh * G + g;
+        qp_i[i] = pos0 + m;
+        ks_i[i] = (swa_window > 0 && qp_i[i] >= swa_window) ? (qp_i[i] - swa_window + 1) : 0;
+        const bool has_sink = ok_i[i] && sink_logit != nullptr;
+        m_i[i] = has_sink ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+        l_i[i] = has_sink ? 1.0f : 0.0f;
+        o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    }
+    const int q_first = pos0 + q0, q_last = pos0 + q0 + nq - 1;
+    const int k_lo = (swa_window > 0 && q_first >= swa_window) ? (q_first - swa_window + 1) : 0;
+    const int d0 = lane * 4;
+
+    for (int kt = k_lo; kt <= q_last; kt += BK) {
+        __syncthreads();
+        // load the K/V tile (keys kt .. kt+BK-1, clipped at q_last)
+        constexpr int ROWB = D * KB;            // bytes per key row
+        constexpr int PER = (BK * ROWB) / 256;  // bytes per thread: fp8 16, fp16 32
+        {
+            const int j = (tid * PER) / ROWB, off = (tid * PER) % ROWB;
+            const int kp = kt + j;
+            uint4 kw[PER / 16], vw[PER / 16];
+            if (kp <= q_last) {
+                const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+                const size_t tok_base = static_cast<size_t>(pt_row[ring_p >> 6]) * 64 + (ring_p & 63);
+                const size_t base = (tok_base * elems + kvh * D) * KB + off;
+#pragma unroll
+                for (int u = 0; u < PER / 16; ++u) {
+                    kw[u] = *reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(k_pool) + base + 16 * u);
+                    vw[u] = *reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(v_pool) + base + 16 * u);
+                }
+                if (off == 0) {
+                    sKs[j] = (FP8_KV && k_scales) ? k_scales[tok_base] : 1.0f;
+                    sVs[j] = (FP8_KV && v_scales) ? v_scales[tok_base] : 1.0f;
+                }
+            } else {
+#pragma unroll
+                for (int u = 0; u < PER / 16; ++u) { kw[u] = make_uint4(0, 0, 0, 0); vw[u] = make_uint4(0, 0, 0, 0); }
+                if (off == 0) { sKs[j] = 0.0f; sVs[j] = 0.0f; }
+            }
+#pragma unroll
+            for (int u = 0; u < PER / 16; ++u) {
+                *reinterpret_cast<uint4*>(sK + j * ROWB + off + 16 * u) = kw[u];
+                *reinterpret_cast<uint4*>(sV + j * ROWB + off + 16 * u) = vw[u];
+            }
+        }
+        __syncthreads();
+        // scores: lane = key c
+        float acc[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+        const int c = lane;
+        for (int d = 0; d < D; d += 4) {
+            float k0, k1, k2, k3;
+            if constexpr (FP8_KV) {
+                const uint32_t w = *reinterpret_cast<const uint32_t*>(sK + c * ROWB + d);
+                k0 = e4m3fn_to_f32(static_cast<uint8_t>(w & 0xFFu));
+                k1 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 8) & 0xFFu));
+                k2 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 16) & 0xFFu));
+                k3 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 24) & 0xFFu));
+            } else {
+                const uint2 w = *reinterpret_cast<const uint2*>(sK + c * ROWB + d * 2);
+                h2_unpack(w.x, k0, k1); h2_unpack(w.y, k2, k3);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float4 q = *reinterpret_cast<const float4*>(&sQ[wave + 8 * i][d]);
+                acc[i] = fmaf(q.x, k0, fmaf(q.y, k1, fmaf(q.z, k2, fmaf(q.w, k3, acc[i]))));
+            }
+        }
+        const int kp = kt + c;
+        const float kscale = sKs[c];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int r = wave + 8 * i;
+            const bool valid = ok_i[i] && kp <= qp_i[i] && kp >= ks_i[i];
+            float s = acc[i] * kscale;
+            if (valid && rel_bias) {
+                const int dist = qp_i[i] - kp;
+                if (dist < max_rel) {
+                    const int g = r / BQ, qi = r % BQ;
+                    s += rel_bias[(static_cast<size_t>(q0 + qi) * n_q_heads + kvh * G + g) * max_rel + dist];
+                }
+            }
+            const float mx = wave32_max_f(valid ? s : -1e30f);
+            const float m_new = fmaxf(m_i[i], mx);
+            const float alpha = __expf(m_i[i] - m_new);
+            const float p = valid ? __expf(s - m_new) : 0.0f;
+            l_i[i] = fmaf(l_i[i], alpha, wave32_sum_f(p));
+            m_i[i] = m_new;
+            o[i][0] *= alpha; o[i][1] *= alpha; o[i][2] *= alpha; o[i][3] *= alpha;
+            sP[r][c] = p;
+        }
+        __syncthreads();
+        // P*V: lane = 4 output dims
+        for (int cc = 0; cc < BK; ++cc) {
+            float v0, v1, v2, v3;
+            const float vs = sVs[cc];
+            if constexpr (FP8_KV) {
+                const uint32_t w = *reinterpret_cast<const uint32_t*>(sV + cc * ROWB + d0);
+                v0 = e4m3fn_to_f32(static_cast<uint8_t>(w & 0xFFu)) * vs;
+                v1 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 8) & 0xFFu)) * vs;
+                v2 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 16) & 0xFFu)) * vs;
+                v3 = e4m3fn_to_f32(static_cast<uint8_t>((w >> 24) & 0xFFu)) * vs;
+            } else {
+                const uint2 w = *reinterpret_cast<const uint2*>(sV + cc * ROWB + d0 * 2);
+                h2_unpack(w.x, v0, v1); h2_unpack(w.y, v2, v3);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p = sP[wave + 8 * i][cc];
+                o[i][0] = fmaf(p, v0, o[i][0]); o[i][1] = fmaf(p, v1, o[i][1]);
+                o[i][2] = fmaf(p, v2, o[i][2]); o[i][3] = fmaf(p, v3, o[i][3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (!ok_i[i]) continue;
+        const int r = wave + 8 * i, g = r / BQ, qi = r % BQ;
+        const size_t ob = (static_cast<size_t>(q0 + qi) * n_q_heads + kvh * G + g) * D + d0;
+        const float inv = 1.0f / fmaxf(l_i[i], 1e-30f);
+        float r0 = o[i][0] * inv, r1 = o[i][1] * inv, r2 = o[i][2] * inv, r3 = o[i][3] * inv;
+        if (gate_attn != nullptr) {
+            const float4 gv = *reinterpret_cast<const float4*>(gate_attn + ob);
+            r0 *= 1.0f / (1.0f + __expf(-gv.x)); r1 *= 1.0f / (1.0f + __expf(-gv.y));
+            r2 *= 1.0f / (1.0f + __expf(-gv.z)); r3 *= 1.0f / (1.0f + __expf(-gv.w));
+        }
+        *reinterpret_cast<float4*>(O_out + ob) = make_float4(r0, r1, r2, r3);
+    }
+}
+
 // 4-Wave Split-KV Flash-SWA / Flash-GQA for small batches (M <= 8: B=1 decode & B=8 DSpark verify!):
 // Launches 1 block per (qh, m) = 24 blocks x 4 waves = 96 waves at B=1 (4x-8x faster at P=256..2048!).
 // Zero barrier in the entire KV loop; 1 single __syncthreads() at the end merges the 4 waves' online softmax!
