@@ -4243,6 +4243,12 @@ private:
         uint64_t kv_gen_sum = dspark_ptr_gen_;
         for (const auto& p : swa_pools_) kv_gen_sum += p.pool_gen;
         for (const auto& p : glob_pools_) kv_gen_sum += p.pool_gen;
+        {   // GQA split kernel only past 8K keys (fewer blocks lose below that); both give identical bits, so the switch is free
+            int mx = 0;
+            for (int b = 0; b < B; ++b) mx = std::max(mx, batch.pos[b]);
+            attn_long_ = mx >= 8192;
+            if (attn_long_) kv_gen_sum += 1ull << 40;   // a different captured graph
+        }
 
         const int prof_mode = (std::getenv("STRATA_HIP_PROF") ? std::atoi(std::getenv("STRATA_HIP_PROF")) : 0);
         const bool use_graph = (prof_mode < 2) && all_gpu_layers && all_want_logits && max_img_row < 0 && taps_out == nullptr &&
@@ -4706,7 +4712,7 @@ private:
                         aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 }
             } else if (B <= 4 || exact_rows_) {   // #6671: the one-token kernel for every verify row
-                const bool gqa3 = c_.n_kv * 3 == c_.n_head && splitkv_gqa();
+                const bool gqa3 = c_.n_kv * 3 == c_.n_head && splitkv_gqa() && attn_long_;
                 // 2-Stage FlashDecoding Split-KV (96 blocks x 8 waves = 768 waves at B=1 -> saturates ALL CUs!)
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
                 if (is_fp8) {
@@ -6794,7 +6800,8 @@ private:
         static const bool on = [] { const char* e = std::getenv("STRATA_INK_SPLITKV_GQA"); return !(e && e[0] == '0'); }();
         return on;
     }
-    bool ks16_ = false;   // split-KV attention may use up to 16 splits (max context > 8K)
+    bool ks16_ = false;
+    bool attn_long_ = false;   // split-KV attention may use up to 16 splits (max context > 8K)
     static bool rdna2_tiled_attn() {
         static const bool on = [] { const char* e = std::getenv("STRATA_INK_TILED_ATTN"); return !(e && e[0] == '0'); }();
         return on;
