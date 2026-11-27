@@ -127,11 +127,12 @@ __global__ void __launch_bounds__(256) k_dspark_ctx_scatter(
     uint16_t* const* __restrict__ dst_tbl, // [max_slots] per-slot base pointers
     const int32_t* __restrict__ slot_ids,  // [B]
     const int32_t* __restrict__ pos,       // [B]
-    int B, int cols) {
+    int B, int cols, int ring) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int b = blockIdx.y;
     if (c >= cols || b >= B) return;
-    uint16_t* dst = dst_tbl[slot_ids[b]] + static_cast<size_t>(pos[b]) * cols;
+    const int p = (ring > 0) ? (pos[b] % ring) : pos[b];
+    uint16_t* dst = dst_tbl[slot_ids[b]] + static_cast<size_t>(p) * cols;
     dst[c] = strata::inkling2::hip::f32_to_bf16(src[static_cast<size_t>(b) * cols + c]);
 }
 
@@ -2278,7 +2279,7 @@ public:
             k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B), 128, 0, stream_>>>(
                 q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                 reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                kd, vd, d_toks, ao, B, H, KV, swa_w);
+                kd, vd, d_toks, ao, B, H, KV, ds_win(swa_w), ds_ring_);
 
             launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B, D, q_dim);
             k_vec_add<<<(B * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B * D);
@@ -2300,7 +2301,7 @@ public:
         k_rms_norm_rows<<<B, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B, D, dspark_cfg_.rms_eps);
         k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
             reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_toks,
-            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank);
+            res, reinterpret_cast<float*>(d_dspark_state_.dev_ptr), D, rank, ds_ring_);
         if (ds_prof) (void)hipEventRecord(devt[1], stream_);
 
         const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
@@ -2537,7 +2538,7 @@ public:
                     k_dspark_block_attn_dyn<<<dim3((H + 3) / 4, B_ds), 128, 0, stream_>>>(
                         q, reinterpret_cast<const uint16_t*>(sl.dspark_k[il].dev_ptr),
                         reinterpret_cast<const uint16_t*>(sl.dspark_v[il].dev_ptr),
-                        kd, vd, d_hdr, ao, B_ds, H, KV, swa_w);
+                        kd, vd, d_hdr, ao, B_ds, H, KV, ds_win(swa_w), ds_ring_);
                     launch_bf16_opt(ds_bf16(p + ".self_attn.o_proj.weight"), ao, nullptr, h, B_ds, D, q_dim);
                     k_vec_add<<<(B_ds * D + 255) / 256, 256, 0, stream_>>>(cur, h, cur, B_ds * D);
 
@@ -2551,7 +2552,7 @@ public:
                 k_rms_norm_rows<<<B_ds, 256, 0, stream_>>>(cur, ds_f32("norm.weight"), cur, B_ds, D, dspark_cfg_.rms_eps);
                 k_dspark_load_frnn_zero<<<(std::max(D, rank) + 255) / 256, 256, 0, stream_>>>(
                     reinterpret_cast<const uint16_t*>(sl.dspark_frnn.dev_ptr), d_hdr,
-                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank);
+                    res, reinterpret_cast<float*>(d_beam_st_a_.dev_ptr), D, rank, ds_ring_);
 
                 const auto& unemb_pk = packed_trunk_.at("model.llm.unembed.weight");
                 const int V = c_.vocab_unpadded;
@@ -3701,8 +3702,16 @@ private:
     }
 
     bool ensure_dspark_slot_cap(GpuSlotMeta& sl, int need_len, std::string& err) {
+        if (ds_ring_ == 0) {
+            // The drafter only has to propose tokens (the verify is exact), so past STRATA_INK_DSPARK_CTX positions (default 8192) its
+            // context is a ring of the most recent ones: ~136 MiB instead of ~16.6 KiB per token of the window (2.1 GiB at 128K).
+            const char* e = std::getenv("STRATA_INK_DSPARK_CTX");
+            const int r = e ? std::atoi(e) : 8192;
+            ds_ring_ = (r > 0 && max_ctx_ + 16 > r) ? std::max(2048, r) : -1;
+        }
+        if (ds_ring_ > 0) need_len = ds_ring_;
         if (need_len <= sl.dspark_cap) return true;
-        const int max_cap = std::max(need_len, max_ctx_ + 16);
+        const int max_cap = (ds_ring_ > 0) ? ds_ring_ : std::max(need_len, max_ctx_ + 16);
         const int new_cap = std::min(max_cap, std::max(need_len, std::max(256, sl.dspark_cap * 2)));
         const int kv_dim = dspark_cfg_.n_kv * dspark_cfg_.head_dim;
         const int D = dspark_cfg_.hidden;
@@ -5395,16 +5404,16 @@ private:
             k_rms_norm_rows<<<B * KV, 256, 0, stream_>>>(kc, ds_f32(p + ".self_attn.k_norm_ctx.weight"), kc, B * KV, hd, dspark_cfg_.rms_eps);
             k_half_rope<<<dim3(KV, B), hd / 2, 0, stream_>>>(kc, pos_d, 0, B, KV, hd, dspark_cfg_.rope_theta);
             k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
-                kc, reinterpret_cast<uint16_t* const*>(d_ds_k_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+                kc, reinterpret_cast<uint16_t* const*>(d_ds_k_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim, ds_ring_);
             k_dspark_ctx_scatter<<<dim3((kv_dim + 255) / 256, B), 256, 0, stream_>>>(
-                vc, reinterpret_cast<uint16_t* const*>(d_ds_v_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim);
+                vc, reinterpret_cast<uint16_t* const*>(d_ds_v_ptrs_[il].dev_ptr), sids_d, pos_d, B, kv_dim, ds_ring_);
         }
         float w_rnn[4];
         softmax4(dspark_cfg_.n_layers, w_rnn);
         k_dspark_fuse_mix<<<B, 256, 0, stream_>>>(t0, t1, t2, t3, w_rnn[0], w_rnn[1], w_rnn[2], w_rnn[3],
                                                   ds_f32("markov_head.dflare_norm.weight"), ctx, B, D, dspark_cfg_.rms_eps);
         k_dspark_ctx_scatter<<<dim3((D + 255) / 256, B), 256, 0, stream_>>>(
-            ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D);
+            ctx, reinterpret_cast<uint16_t* const*>(d_ds_frnn_ptrs_.dev_ptr), sids_d, pos_d, B, D, ds_ring_);
     }
 
     bool ensure_tree_scratch(std::string& err) {
@@ -6426,6 +6435,12 @@ private:
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
     GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
     bool tree_fp8_exact_ = false;
+    int ds_ring_ = 0;   // 0 = not decided, -1 = linear context, > 0 = ring size
+    int ds_win(int swa_w) const {
+        if (ds_ring_ <= 0) return swa_w;
+        const int lim = ds_ring_ - 16;
+        return (swa_w > 0) ? std::min(swa_w, lim) : lim;
+    }
     double ema_t1_ms_ = 0.0;
     double ema_tree_ms_[kTreeMaxM + 1] = {};
     GpuBuffer d_tree_rec_k_, d_tree_rec_v_, d_tree_rec_attn_, d_tree_rec_mlp_;
