@@ -56,6 +56,22 @@ design keeps experts in system RAM, and TheRock's VRAM cap left 2432 of 3072 exp
 0.2.23 with the DFlash 2 drafter on SQ-10 (2K 143 / 31.6, 32K 94.6 / 23.8 tok/s, below this fork's 227 / 60.7 and
 180 / 32.5); project-maya's only Inkling quant is 16.4 GB.
 
+Tried after the switch (2026-11-27, late), none adopted:
+- **Drafter window cap.** The DSpark drafter (`dflash` arch, 3 layers, window pattern `[True, False, True]`, n_swa 1025)
+  has one full-attention layer whose KV and attention buffers scale with `-c`. Forcing all three layers onto one
+  8192 window (env-gated patch in `src/models/dflash.cpp`, since reverted) cut its KV from 131072 to 8448 cells and
+  let 120K load (128K left 35 MiB, and the lazy hipBLAS handle then failed with `CUBLAS_STATUS_ALLOC_FAILED`), but at
+  a 15K prompt acceptance fell from 168/392 to 28/509 and decode from 43.4 to 19.2 tok/s: the two trained-SWA layers
+  cannot see 8K. Doing it right needs a per-layer window (two SWA masks in the iswa cache).
+- **`-ub 128`** (frees ~390 MiB of the main 778 MiB compute buffer at 128K): 15K prefill 451 -> 319 tok/s.
+- **`speculative.n_max` per request** (2, 3, 4): identical speed and acceptance; DSpark drafts fixed 8-token blocks.
+
+VRAM at 128K, ub 256 (from `-v`): model 8444 MiB, KV 2176 + 106 (SWA) + 15 (recurrent), compute 778 MiB,
+drafter 374 MiB + KV 28 MiB (with the window cap) + compute ~100 MiB, of 12272.
+
+The service runs `/mnt/win/llm-temp/llama-live/llama-server` (a copy of `build-tr/bin`, first on `LD_LIBRARY_PATH`
+because the build's RUNPATH points at `build-tr/bin`), so rebuilding llama.cpp never touches the live server.
+
 Rebuild after a reboot: `deploy/restore.sh` installs `llama-inkling.service` by default (`SERVER=strata` for the
 old engine). Build recipe: `cmake -B build-tr -G Ninja -DGGML_HIP=ON -DGPU_TARGETS=gfx1031
 -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=$R` with `R=/mnt/win/llm-temp/therock/_rocm_sdk_devel`

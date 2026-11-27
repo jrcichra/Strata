@@ -60,7 +60,7 @@ fi
 # SERVER=strata: the old Strata fork engine (rollback).
 SERVER=${SERVER:-llama}
 if [ "$SERVER" = llama ]; then
-  LB=/mnt/win/llm-temp/llama.cpp/build-tr/bin/llama-server
+  LB=/mnt/win/llm-temp/llama-live/llama-server
   G=/mnt/win/llm-temp/gguf/gsq-rco
   for f in "$LB" "$G/Inkling-2-Mini-GSQ-RCO-Q2_K_XL.gguf" "$G/dspark-Inkling-2-Mini-Q8_0.gguf" \
            "$G/mmproj-Inkling-2-Mini-BF16.gguf" /mnt/win/llm-temp/therock/_rocm_sdk_devel/lib/libhipblas.so.3; do
@@ -73,7 +73,22 @@ if [ "$SERVER" = llama ]; then
   sudo systemctl disable strata-inkling >/dev/null 2>&1 || true
   sudo systemctl enable llama-inkling >/dev/null 2>&1
   say "  llama-inkling installed and enabled at boot (strata-inkling installed, disabled)"
-  say "  pi: set providers.local.models[0].contextWindow to 102400 in ~/.pi/agent/models.json"
+  CTX=$(grep -oE -- '-c [0-9]+' "$DOC/deploy/llama-inkling.service" | awk '{print $2}')
+  PIM=/home/ubuntu/.pi/agent/models.json
+  if [ -f "$PIM" ]; then
+    python3 - "$PIM" "$CTX" <<'PY'
+import json, sys
+p, ctx = sys.argv[1], int(sys.argv[2])
+c = json.load(open(p))
+m = c.get("providers", {}).get("local", {}).get("models", [])
+if m and m[0].get("contextWindow") != ctx:
+    m[0]["contextWindow"] = ctx
+    json.dump(c, open(p, "w"), indent=2)
+    print(f"  pi: local contextWindow set to {ctx}")
+PY
+  else
+    say "  pi: $PIM not found; set providers.local.models[0].contextWindow to $CTX once pi is set up"
+  fi
   say ""
   say "Start: sudo systemctl start llama-inkling && journalctl -u llama-inkling -f   (~70 s load)"
   say "Rollback: SERVER=strata $0, then sudo systemctl start strata-inkling"
