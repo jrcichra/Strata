@@ -11,7 +11,7 @@ User=ubuntu
 Group=ubuntu
 Environment=HOME=/home/ubuntu
 # Strata's bundled HIP runtime (sees all 12 GiB; Ubuntu's segfaults, TheRock's caps VRAM at half of RAM) + TheRock hipBLAS/rocBLAS
-Environment=LD_LIBRARY_PATH=/mnt/win/llm-temp/llama-live:/mnt/win/llm-temp/engines/inkling2-rdna2-local:/mnt/win/llm-temp/therock/_rocm_sdk_devel/lib
+Environment=LD_LIBRARY_PATH=/mnt/win/llm-temp/llama-live:/mnt/win/llm-temp/therock7141/lib
 # LLAMA_API_KEY (same key as Strata's STRATA_API_KEY, so pi needs no change)
 EnvironmentFile=/etc/strata/llama.env
 # -lm none: mmap over the NTFS (FUSE) mount stalls for many minutes.

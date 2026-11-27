@@ -1,5 +1,11 @@
 # Inkling 2 Mini SQ-10 on an RX 6700 XT eGPU (gfx1031) — RDNA2 grouped-MoE work
 
+> **Frozen 2026-11-27.** The box now runs stock llama.cpp on AMD TheRock 7.14.1, with no Strata
+> code or libraries. The live runbook (unit, restore script, measurements) moved to
+> `jrcichra/cloud-k8s`, directory `egpu-6700xt/`. This branch is kept as the archive of the Strata
+> RDNA2 work and its benchmarks; the deploy files below are no longer what runs.
+
+
 Protocol: `strata-inkling --bench --native <SQ-10.strata> --parallel 1 --kv fp8 --vram-experts-gb 8.77 --ram-experts-gb 0`.
 Numbers are this machine only; nothing here is a statement about other AMD cards or later releases.
 
