@@ -2180,6 +2180,134 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_splitkv(
     }
 }
 
+// Split count of the split-KV attention for total_kv keys: 4 (the historical value, bit-identical results) up to 8K keys,
+// then one split per 2K keys up to KSMAX, so a 128K context runs 16 x 8 waves per head instead of 4 x 8. The one-token
+// step and the tree verify both use this, so a verify row stays equal to the step at its position.
+template <int KSMAX>
+__device__ __forceinline__ int splitkv_nsplit(int total_kv) {
+    if (KSMAX <= 4) return KSMAX;
+    if (total_kv <= 8192) return 4;
+    return min(KSMAX, (total_kv + 2047) / 2048);
+}
+
+// k3_flash_splitkv_part for the G query heads that share one KV head, in one block: each K/V row is read once instead of
+// G times. Per head the arithmetic is k3_flash_splitkv_part's, operation for operation (same wave walk, same expressions,
+// same merge), so the partials are bit-identical and the tree verify (still per head) stays equal to the step.
+// Grid (n_kv_heads, M, KSPLITS), Block 256.
+template <bool FP8_KV, int KSPLITS, int G>
+__global__ void __launch_bounds__(256) k3_flash_splitkv_part_gqa(
+    const float* __restrict__ Q, const float* __restrict__ rel_bias, const float* __restrict__ sink_logit,
+    const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ page_table, int max_pages_per_slot,
+    const void* __restrict__ k_pool, const void* __restrict__ v_pool,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales,
+    float* __restrict__ partials, int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
+    const int wave = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int kvh = blockIdx.x;
+    const int m = blockIdx.y;
+    const int sp = blockIdx.z;
+    if (kvh >= n_kv_heads || m >= M || sp >= KSPLITS) return;
+    const int d0 = lane * 4;
+    const int slot = slot_ids[m];
+    const int cur_pos = pos[m];
+    const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
+    const int total_kv = cur_pos - k_start + 1;
+    const int ks_eff = splitkv_nsplit<KSPLITS>(total_kv);
+    const int chunk = (total_kv + ks_eff - 1) / ks_eff;
+    const int sp_beg = k_start + sp * chunk;
+    const int sp_end = min(cur_pos + 1, sp_beg + chunk);
+    const float scale = rsqrtf(128.0f);
+    float q0[G], q1[G], q2[G], q3[G], max_l[G], sum_exp[G], o0[G], o1[G], o2[G], o3[G];
+    const float* rb_row[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const int qh = kvh * G + g;
+        const float4 qv = *reinterpret_cast<const float4*>(Q + (static_cast<size_t>(m) * n_q_heads + qh) * 128 + d0);
+        q0[g] = qv.x * scale; q1[g] = qv.y * scale; q2[g] = qv.z * scale; q3[g] = qv.w * scale;
+        max_l[g] = (sp == 0 && wave == 0 && sink_logit) ? sink_logit[static_cast<size_t>(m) * n_q_heads + qh] : -1e30f;
+        sum_exp[g] = (sp == 0 && wave == 0 && sink_logit) ? 1.0f : 0.0f;
+        o0[g] = o1[g] = o2[g] = o3[g] = 0.0f;
+        rb_row[g] = rel_bias ? (rel_bias + (static_cast<size_t>(m) * n_q_heads + qh) * max_rel) : nullptr;
+    }
+    const int elems = n_kv_heads * 128;
+    const int kv_off = kvh * 128 + d0;
+    const int32_t* pt_row = page_table + slot * max_pages_per_slot;
+
+    for (int kp = sp_beg + wave; kp < sp_end; kp += 8) {
+        const int ring_p = (swa_window > 0) ? (kp % swa_ring) : kp;
+        const int phys = pt_row[ring_p >> 6];
+        const size_t tok_base = static_cast<size_t>(phys) * 64 + (ring_p & 63);
+        const size_t base = tok_base * elems + kv_off;
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        if constexpr (FP8_KV) {
+            const float ks = k_scales ? k_scales[tok_base] : 1.0f;
+            const float vs = v_scales ? v_scales[tok_base] : 1.0f;
+            const uint32_t kw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(k_pool) + base);
+            const uint32_t vw = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(v_pool) + base);
+            k0 = e4m3fn_to_f32(static_cast<uint8_t>(kw & 0xFFu)) * ks;
+            k1 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 8) & 0xFFu)) * ks;
+            k2 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 16) & 0xFFu)) * ks;
+            k3 = e4m3fn_to_f32(static_cast<uint8_t>((kw >> 24) & 0xFFu)) * ks;
+            v0 = e4m3fn_to_f32(static_cast<uint8_t>(vw & 0xFFu)) * vs;
+            v1 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 8) & 0xFFu)) * vs;
+            v2 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 16) & 0xFFu)) * vs;
+            v3 = e4m3fn_to_f32(static_cast<uint8_t>((vw >> 24) & 0xFFu)) * vs;
+        } else {
+            const uint2 kw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(k_pool) + base);
+            const uint2 vw = *reinterpret_cast<const uint2*>(static_cast<const half_t*>(v_pool) + base);
+            h2_unpack(kw.x, k0, k1); h2_unpack(kw.y, k2, k3);
+            h2_unpack(vw.x, v0, v1); h2_unpack(vw.y, v2, v3);
+        }
+        const int dist = cur_pos - kp;
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float sc = wave32_sum(fmaf(q0[g], k0, fmaf(q1[g], k1, fmaf(q2[g], k2, q3[g] * k3))));
+            if (rb_row[g] && dist < max_rel) sc += rb_row[g][dist];
+            const float new_max = fmaxf(max_l[g], sc);
+            const float alpha = __expf(max_l[g] - new_max);
+            const float beta = __expf(sc - new_max);
+            o0[g] = fmaf(o0[g], alpha, beta * v0);
+            o1[g] = fmaf(o1[g], alpha, beta * v1);
+            o2[g] = fmaf(o2[g], alpha, beta * v2);
+            o3[g] = fmaf(o3[g], alpha, beta * v3);
+            sum_exp[g] = fmaf(sum_exp[g], alpha, beta);
+            max_l[g] = new_max;
+        }
+    }
+
+    __shared__ float s_max[G][8];
+    __shared__ float s_sum[G][8];
+    __shared__ alignas(16) float4 s_o[G][8][32];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        if (lane == 0) { s_max[g][wave] = max_l[g]; s_sum[g][wave] = sum_exp[g]; }
+        s_o[g][wave][lane] = make_float4(o0[g], o1[g], o2[g], o3[g]);
+    }
+    __syncthreads();
+    if (wave < G) {
+        const int g = wave;
+        float gmax = -1e30f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) gmax = fmaxf(gmax, s_max[g][w]);
+        float tot_s = 0.0f;
+        float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (s_sum[g][w] > 0.0f) {
+                const float wt = __expf(s_max[g][w] - gmax);
+                tot_s += wt * s_sum[g][w];
+                const float4 p = s_o[g][w][lane];
+                r0 = fmaf(wt, p.x, r0); r1 = fmaf(wt, p.y, r1);
+                r2 = fmaf(wt, p.z, r2); r3 = fmaf(wt, p.w, r3);
+            }
+        }
+        float* dst = partials + ((static_cast<size_t>(m) * n_q_heads + kvh * G + g) * KSPLITS + sp) * 130;
+        *reinterpret_cast<float4*>(dst + d0) = make_float4(r0, r1, r2, r3);
+        if (lane == 0) { dst[128] = gmax; dst[129] = tot_s; }
+    }
+}
+
 // 2-Stage FlashDecoding Split-KV Attention for B <= 4 (Saturates ALL 64 CUs on R9700 & 40 CUs on Strix Halo!):
 // Stage 1: Grid = (n_q_heads, M, kSplits=4), Block = 256 (8 waves -> 32 parallel KV walkers per head = 768 waves at B=1!)
 // Writes tiny partials [M, n_q_heads, kSplits, 130] (o[128], max_l, sum_e) -> 100% L2-resident!
@@ -2211,7 +2339,8 @@ __global__ void __launch_bounds__(256) k3_flash_splitkv_part(
     const int cur_pos = pos[m];
     const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
     const int total_kv = cur_pos - k_start + 1;
-    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int ks_eff = splitkv_nsplit<KSPLITS>(total_kv);
+    const int chunk = (total_kv + ks_eff - 1) / ks_eff;   // splits past ks_eff are empty (neutral partials)
     const int sp_beg = k_start + sp * chunk;
     const int sp_end = min(cur_pos + 1, sp_beg + chunk);
 

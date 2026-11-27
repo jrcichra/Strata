@@ -761,6 +761,7 @@ __global__ void __launch_bounds__(128) k3_flash_swa_gqa_tree(
 // softmax and the same two-level merge, so that row m of a verify tree is the value the step at that position gives.  Keys below
 // base_pos come from the paged pool, the keys above it are the node's ancestors in the tree scratch (FP16, the value the pool
 // would hold; FP16 KV only).  Stage 2 is k3_flash_splitkv_reduce.  Grid: (n_q_heads, M, 4), Block: 256
+template <int KSPLITS = 4>
 __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
     const float* __restrict__ Q,
     const float* __restrict__ rel_bias,
@@ -775,7 +776,6 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
     const half_t* __restrict__ tree_v,
     float* __restrict__ partials,           // [M, n_q_heads, 4, 130]
     int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
-    constexpr int KSPLITS = 4;
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
@@ -802,7 +802,8 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
     const int slot = tmeta->slot;
     const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
     const int total_kv = cur_pos - k_start + 1;
-    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int ks_eff = splitkv_nsplit<KSPLITS>(total_kv);
+    const int chunk = (total_kv + ks_eff - 1) / ks_eff;   // splits past ks_eff are empty (neutral partials)
     const int sp_beg = k_start + sp * chunk;
     const int sp_end = min(cur_pos + 1, sp_beg + chunk);
 
@@ -883,6 +884,7 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part(
     }
 }
 
+template <int KSPLITS = 4>
 __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part_fp8(
     const float* __restrict__ Q,
     const float* __restrict__ rel_bias,
@@ -901,7 +903,6 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part_fp8(
     const float* __restrict__ tree_vs,
     float* __restrict__ partials,           // [M, n_q_heads, 4, 130]
     int M, int n_q_heads, int n_kv_heads, int swa_window, int swa_ring, int max_rel) {
-    constexpr int KSPLITS = 4;
     const int wave = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int qh = blockIdx.x;
@@ -928,7 +929,8 @@ __global__ void __launch_bounds__(256) k3_flash_tree_splitkv_part_fp8(
     const int slot = tmeta->slot;
     const int k_start = (swa_window > 0 && cur_pos >= swa_window) ? (cur_pos - swa_window + 1) : 0;
     const int total_kv = cur_pos - k_start + 1;
-    const int chunk = (total_kv + KSPLITS - 1) / KSPLITS;
+    const int ks_eff = splitkv_nsplit<KSPLITS>(total_kv);
+    const int chunk = (total_kv + ks_eff - 1) / ks_eff;   // splits past ks_eff are empty (neutral partials)
     const int sp_beg = k_start + sp * chunk;
     const int sp_end = min(cur_pos + 1, sp_beg + chunk);
 

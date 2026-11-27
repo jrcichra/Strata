@@ -984,6 +984,7 @@ public:
         }
         max_slots_ = std::max(1, std::min(kMaxParallelSlots, opts.parallel));
         max_ctx_ = std::max(256, opts.max_ctx);
+        ks16_ = max_ctx_ > 8192;
         // SWA KV ring. forward_batch_chunk stores K/V of all B batch tokens before attention reads the ring, so a
         // ring of exactly swa_win positions lets a later token of the same batch overwrite a key that an earlier
         // query of that batch still needs (ring slot (p - swa_win + j) % swa_win == (p + j) % swa_win).
@@ -3928,7 +3929,7 @@ private:
             !re(sc_sinks_, static_cast<size_t>(B) * c_.n_head * 4) || !re(sc_gate_a_, static_cast<size_t>(B) * q_dim * 4) ||
             !re(sc_k_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) || !re(sc_v_dyn_, static_cast<size_t>(B) * c_.n_kv * 4 * 4) ||
             !re(sc_attn_out_, static_cast<size_t>(B) * q_dim * 4) ||
-            !re(sc_splitkv_part_, static_cast<size_t>(std::max(B, 4)) * c_.n_head * 4 * 130 * 4) ||
+            !re(sc_splitkv_part_, static_cast<size_t>(std::max(B, 4)) * c_.n_head * 16 * 130 * 4) ||
             !re(sc_o_proj_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_a_sconv_, static_cast<size_t>(B) * D * 4) || !re(sc_mlp_in_, static_cast<size_t>(B) * D * 4) ||
             !re(sc_mlp_f16_, static_cast<size_t>(moe_gu_cap) * D * sizeof(half_t)) ||
@@ -4705,23 +4706,44 @@ private:
                         aout, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 }
             } else if (B <= 4 || exact_rows_) {   // #6671: the one-token kernel for every verify row
+                const bool gqa3 = c_.n_kv * 3 == c_.n_head && splitkv_gqa();
                 // 2-Stage FlashDecoding Split-KV (96 blocks x 8 waves = 768 waves at B=1 -> saturates ALL CUs!)
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
                 if (is_fp8) {
-                    k3_flash_splitkv_part<true, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                    if (gqa3) { if (ks16_) k3_flash_splitkv_part_gqa<true, 16, 3><<<dim3(c_.n_kv, B, 16), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); else k3_flash_splitkv_part_gqa<true, 4, 3><<<dim3(c_.n_kv, B, 4), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); } else if (ks16_) k3_flash_splitkv_part<true, 16><<<dim3(c_.n_head, B, 16), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                        reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); else k3_flash_splitkv_part<true, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
                         q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                         reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                         kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
                         reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
                         sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 } else {
-                    k3_flash_splitkv_part<false, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                    if (ks16_) k3_flash_splitkv_part<false, 16><<<dim3(c_.n_head, B, 16), 256, 0, stream_>>>(
+                        q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
+                        reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                        kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
+                        sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); else k3_flash_splitkv_part<false, 4><<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
                         q, rbias, sinks, reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr), pos_dev,
                         reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                         kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, nullptr, nullptr,
                         sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
                 }
-                k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(
+                if (ks16_) k3_flash_splitkv_reduce<16><<<dim3(c_.n_head, B), 32, 0, stream_>>>(
+                    sp_part, gatea, aout, B, c_.n_head); else k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(
                     sp_part, gatea, aout, B, c_.n_head);
             } else if (B <= 8) {
                 if (is_fp8) {
@@ -6144,23 +6166,33 @@ private:
             const int swa_r = is_swa ? swa_ring_ : 0;
             if (fp8_exact) {
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
-                k3_flash_tree_splitkv_part_fp8<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                if (ks16_) k3_flash_tree_splitkv_part_fp8<16><<<dim3(c_.n_head, B, 16), 256, 0, stream_>>>(
+                    q, rbias, sinks, d_tm, pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
+                    reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
+                    tk8, tv8, tks, tvs,
+                    sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); else k3_flash_tree_splitkv_part_fp8<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
                     q, rbias, sinks, d_tm, pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                     kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr,
                     reinterpret_cast<const float*>(kvp.k_scales.dev_ptr), reinterpret_cast<const float*>(kvp.v_scales.dev_ptr),
                     tk8, tv8, tks, tvs,
                     sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
-                k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head);
+                if (ks16_) k3_flash_splitkv_reduce<16><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head); else k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head);
             } else if (exact_rows_ && !is_fp8) {
                 // #6671: the arithmetic of the one-token step (split-KV, four chunks), so tree row m = step at that position
                 float* sp_part = reinterpret_cast<float*>(sc_splitkv_part_.dev_ptr);
-                k3_flash_tree_splitkv_part<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
+                if (ks16_) k3_flash_tree_splitkv_part<16><<<dim3(c_.n_head, B, 16), 256, 0, stream_>>>(
+                    q, rbias, sinks, d_tm, pos_dev,
+                    reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
+                    kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, tk_v, tv_v,
+                    sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent); else k3_flash_tree_splitkv_part<<<dim3(c_.n_head, B, 4), 256, 0, stream_>>>(
                     q, rbias, sinks, d_tm, pos_dev,
                     reinterpret_cast<const int32_t*>(kvp.d_pt.dev_ptr), kvp.max_pages_per_slot,
                     kvp.k_pool.dev_ptr, kvp.v_pool.dev_ptr, tk_v, tv_v,
                     sp_part, B, c_.n_head, c_.n_kv, swa_w, swa_r, c_.rel_extent);
-                k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head);
+                if (ks16_) k3_flash_splitkv_reduce<16><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head); else k3_flash_splitkv_reduce<4><<<dim3(c_.n_head, B), 32, 0, stream_>>>(sp_part, gatea, aout, B, c_.n_head);
             } else if (is_fp8) {
                 k3_flash_swa_gqa_tree<true><<<dim3(c_.n_head, B), 128, 0, stream_>>>(
                     q, gatea, rbias, sinks, d_tm, pos_dev,
@@ -6758,6 +6790,11 @@ private:
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
     GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
     bool tree_fp8_exact_ = false;
+    static bool splitkv_gqa() {
+        static const bool on = [] { const char* e = std::getenv("STRATA_INK_SPLITKV_GQA"); return !(e && e[0] == '0'); }();
+        return on;
+    }
+    bool ks16_ = false;   // split-KV attention may use up to 16 splits (max context > 8K)
     static bool rdna2_tiled_attn() {
         static const bool on = [] { const char* e = std::getenv("STRATA_INK_TILED_ATTN"); return !(e && e[0] == '0'); }();
         return on;
