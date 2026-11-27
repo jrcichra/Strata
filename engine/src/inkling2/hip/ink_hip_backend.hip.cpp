@@ -29,6 +29,7 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -233,6 +234,71 @@ static bool hip_ok(hipError_t e, const char* ctx, std::string& err) {
 }
 
 // Growable on-demand GPU Paged KV Pool for ONE visit (SWA or Global) across all max_slots!
+// A device buffer that grows and shrinks in place: the address range is reserved once and physical chunks are mapped
+// behind it on demand, so a KV pool never needs the old + new copy of a regrow and its pointer never changes.
+struct VmmRegion {
+    uint8_t* va = nullptr;
+    size_t reserved = 0, mapped = 0, chunk = 2ull << 20;
+    std::vector<hipMemGenericAllocationHandle_t> h;
+    static bool supported() {
+        static const int ok = [] {
+            const char* e = std::getenv("STRATA_INK_KV_VMM");
+            if (e && e[0] == '0') return 0;
+            int dev = 0, v = 0;
+            if (hipGetDevice(&dev) != hipSuccess) return 0;
+            if (hipDeviceGetAttribute(&v, hipDeviceAttributeVirtualMemoryManagementSupported, dev) != hipSuccess) { (void)hipGetLastError(); return 0; }
+            return v;
+        }();
+        return ok != 0;
+    }
+    static size_t up(size_t b, size_t c) { return (b + c - 1) / c * c; }
+    bool reserve(size_t bytes, size_t chunk_b) {
+        chunk = chunk_b;
+        reserved = up(std::max<size_t>(bytes, 1), chunk);
+        void* p = nullptr;
+        if (hipMemAddressReserve(&p, reserved, 0, nullptr, 0) != hipSuccess) { (void)hipGetLastError(); reserved = 0; return false; }
+        va = static_cast<uint8_t*>(p);
+        return true;
+    }
+    bool map_to(size_t bytes) {
+        bytes = std::min(reserved, up(bytes, chunk));
+        int dev = 0;
+        (void)hipGetDevice(&dev);
+        hipMemAllocationProp prop = {};
+        prop.type = hipMemAllocationTypePinned;
+        prop.location.type = hipMemLocationTypeDevice;
+        prop.location.id = dev;
+        hipMemAccessDesc acc = {};
+        acc.location = prop.location;
+        acc.flags = hipMemAccessFlagsProtReadWrite;
+        while (mapped < bytes) {
+            hipMemGenericAllocationHandle_t hd;
+            if (hipMemCreate(&hd, chunk, &prop, 0) != hipSuccess) { (void)hipGetLastError(); return false; }
+            if (hipMemMap(va + mapped, chunk, 0, hd, 0) != hipSuccess) { (void)hipGetLastError(); (void)hipMemRelease(hd); return false; }
+            if (hipMemSetAccess(va + mapped, chunk, &acc, 1) != hipSuccess) {
+                (void)hipGetLastError(); (void)hipMemUnmap(va + mapped, chunk); (void)hipMemRelease(hd); return false;
+            }
+            h.push_back(hd);
+            mapped += chunk;
+        }
+        return true;
+    }
+    void unmap_to(size_t bytes) {   // caller has synchronized the device
+        bytes = up(bytes, chunk);
+        while (mapped > bytes && !h.empty()) {
+            mapped -= chunk;
+            (void)hipMemUnmap(va + mapped, chunk);
+            (void)hipMemRelease(h.back());
+            h.pop_back();
+        }
+    }
+    void release() {
+        unmap_to(0);
+        if (va) (void)hipMemAddressFree(va, reserved);
+        va = nullptr; reserved = mapped = 0;
+    }
+};
+
 struct VisitKvPool {
     bool is_swa = true;
     bool is_fp8 = false;
@@ -254,13 +320,75 @@ struct VisitKvPool {
     GpuBuffer v_pool;
     GpuBuffer k_scales;
     GpuBuffer v_scales;
+    bool vmm = false;                 // k/v/scales live in the VmmRegions below (global pools on discrete cards)
+    VmmRegion vk, vv, vks, vvs;
+    std::function<bool()> on_tight;   // frees other VRAM (the drafter) when the pool cannot grow; true if it freed some
+
+    void drop_storage() {
+        if (vmm) {
+            vk.release(); vv.release(); vks.release(); vvs.release();
+            k_pool = v_pool = k_scales = v_scales = GpuBuffer{};
+            vmm = false;
+        } else {
+            free_gpu_buffer(k_pool); free_gpu_buffer(v_pool);
+            free_gpu_buffer(k_scales); free_gpu_buffer(v_scales);
+        }
+    }
+
+    size_t page_bytes() const { return static_cast<size_t>(kKvPageTokens) * kv_dim * (is_fp8 ? 1u : 2u); }
+
+    bool vmm_map(int pages) {
+        const size_t pb = page_bytes(), sb = static_cast<size_t>(kKvPageTokens) * sizeof(float);
+        if (!vk.map_to(pages * pb) || !vv.map_to(pages * pb)) return false;
+        if (is_fp8 && (!vks.map_to(pages * sb) || !vvs.map_to(pages * sb))) return false;
+        return true;
+    }
+    void vmm_publish() {
+        const int pages = static_cast<int>(std::min(vk.mapped, vv.mapped) / page_bytes());
+        cap_pages = pages;
+        k_pool.dev_ptr = vk.va; k_pool.bytes = vk.mapped;
+        v_pool.dev_ptr = vv.va; v_pool.bytes = vv.mapped;
+        if (is_fp8) { k_scales.dev_ptr = vks.va; k_scales.bytes = vks.mapped; v_scales.dev_ptr = vvs.va; v_scales.bytes = vvs.mapped; }
+    }
+
+    // Grow in place. Returns false (state unchanged apart from extra mapped chunks) when VRAM is exhausted.
+    bool grow_vmm(int min_pages, int max_total_pages) {
+        if (!vmm) {
+            if (cap_pages > 0 || host_offload) return false;   // only from an empty pool
+            const size_t pb = page_bytes(), sb = static_cast<size_t>(kKvPageTokens) * sizeof(float);
+            if (!vk.reserve(max_total_pages * pb, 2ull << 20) || !vv.reserve(max_total_pages * pb, 2ull << 20) ||
+                (is_fp8 && (!vks.reserve(max_total_pages * sb, 64ull << 10) || !vvs.reserve(max_total_pages * sb, 64ull << 10)))) {
+                vk.release(); vv.release(); vks.release(); vvs.release();
+                return false;
+            }
+            vmm = true;
+            ++pool_gen;   // new base pointers
+            static bool said = false;
+            if (!said) { said = true; std::fprintf(stderr, "[ink-hip] global KV pools grow in place (virtual memory, %d pages reserved each)\n", max_total_pages); }
+        }
+        if (vmm_map(min_pages)) { vmm_publish(); return true; }
+        if (on_tight && on_tight() && vmm_map(min_pages)) { vmm_publish(); return true; }
+        vmm_publish();
+        return false;
+    }
+
+    // Unmap the chunks above the highest page in use (after a slot reset). Pointers do not change.
+    void trim() {
+        if (!vmm) return;
+        int hi = 0;
+        for (int32_t e : h_pt) hi = std::max(hi, e + 1);
+        if (hi >= used_pages) return;
+        free_pages.erase(std::remove_if(free_pages.begin(), free_pages.end(), [&](int32_t x) { return x >= hi; }), free_pages.end());
+        used_pages = hi;
+        const size_t pb = page_bytes(), sb = static_cast<size_t>(kKvPageTokens) * sizeof(float);
+        vk.unmap_to(hi * pb); vv.unmap_to(hi * pb);
+        if (is_fp8) { vks.unmap_to(hi * sb); vvs.unmap_to(hi * sb); }
+        vmm_publish();
+    }
 
     void release() {
         free_gpu_buffer(d_pt);
-        free_gpu_buffer(k_pool);
-        free_gpu_buffer(v_pool);
-        free_gpu_buffer(k_scales);
-        free_gpu_buffer(v_scales);
+        drop_storage();
         free_pages.clear();
         h_pt.clear();
         cap_pages = used_pages = 0;
@@ -291,6 +419,7 @@ struct VisitKvPool {
                 pt_dirty = true;
             }
         }
+        std::sort(free_pages.begin(), free_pages.end(), std::greater<int32_t>());   // back() = lowest page
     }
 
     bool try_alloc_pool_buffers(int cap, bool use_host_mapped, GpuBuffer& nk, GpuBuffer& nv, GpuBuffer& nks, GpuBuffer& nvs) {
@@ -320,6 +449,12 @@ struct VisitKvPool {
         const size_t elem_b = is_fp8 ? 1u : 2u;
         const size_t page_b = static_cast<size_t>(kKvPageTokens) * kv_dim * elem_b;
 
+        if (vmm || (!is_swa && !is_uma && !host_offload && cap_pages == 0 && VmmRegion::supported())) {
+            if (grow_vmm(min_pages, max_total_pages)) return true;
+            if (vmm) {
+                std::fprintf(stderr, "[ink-hip] Global KV pool: VRAM exhausted at %d pages, moving it to host-mapped pinned KV\n", min_pages);
+            }
+        }
         int new_cap = std::min(max_total_pages, std::max(min_pages, std::max(16, cap_pages * 2)));
         size_t vfree = 0, vtot = 0;
         const bool have_vinfo = (!is_uma && !host_offload && hipMemGetInfo(&vfree, &vtot) == hipSuccess);
@@ -389,8 +524,7 @@ struct VisitKvPool {
                 return false;
             }
         }
-        free_gpu_buffer(k_pool); free_gpu_buffer(v_pool);
-        free_gpu_buffer(k_scales); free_gpu_buffer(v_scales);
+        drop_storage();
         k_pool = nk; v_pool = nv; k_scales = nks; v_scales = nvs;
         cap_pages = new_cap;
         ++pool_gen;
@@ -571,8 +705,7 @@ public:
                 free_gpu_buffer(ks); free_gpu_buffer(vs);
                 return false;
             }
-            free_gpu_buffer(p.k_pool); free_gpu_buffer(p.v_pool);
-            free_gpu_buffer(p.k_scales); free_gpu_buffer(p.v_scales);
+            p.drop_storage();
             p.k_pool = k; p.v_pool = v; p.k_scales = ks; p.v_scales = vs;
             p.is_fp8 = true;
             p.cap_pages = p.used_pages;
@@ -634,8 +767,7 @@ public:
                 free_gpu_buffer(k); free_gpu_buffer(v);
                 return false;
             }
-            free_gpu_buffer(p.k_pool); free_gpu_buffer(p.v_pool);
-            free_gpu_buffer(p.k_scales); free_gpu_buffer(p.v_scales);
+            p.drop_storage();
             p.k_pool = k; p.v_pool = v;
             p.k_scales = GpuBuffer{}; p.v_scales = GpuBuffer{};
             p.is_fp8 = false;
@@ -920,6 +1052,7 @@ public:
             if (name == embed_k || name == unemb_k) {
                 GpuPackedTensor pt;
                 pt.info = ti;
+                if (std::getenv("STRATA_INK_VRAM_STAGES")) std::fprintf(stderr, "[vram-stage] %s fmt=%d rows=%lld cols=%lld %.0f MiB\n", name.c_str(), (int)ti.fmt, (long long)ti.rows(), (long long)ti.cols(), ti.bytes / 1048576.0);
                 // The input embedding is a gather of one row per token (2.3 KB): keep it in mapped pinned host memory on
                 // discrete cards and give its ~440 MiB of VRAM to the KV cache. STRATA_INK_EMBED_HOST=0 keeps it in VRAM.
                 const char* eh = std::getenv("STRATA_INK_EMBED_HOST");
@@ -1095,6 +1228,7 @@ public:
                                      trunk_q8_.size(), (int)std::count_if(trunk_qkvrg_q8_.begin(), trunk_qkvrg_q8_.end(), [](const DenseQ8& d){ return d.q.dev_ptr != nullptr; }), mx / 1048576.0);
         }
 
+        { size_t f_=0,t_=0; if (std::getenv("STRATA_INK_VRAM_STAGES") && hipMemGetInfo(&f_,&t_)==hipSuccess) std::fprintf(stderr,"[vram-stage] %s free=%.0f MiB\n", "trunk", f_/1048576.0); }
         // 2. Load embedded DSpark tensors to GPU if present & enabled
         has_dspark_ = opts.enable_dspark && dspark_cfg_.present;
         if (has_dspark_) {
@@ -1180,6 +1314,7 @@ public:
             }
         }
 
+        { size_t f_=0,t_=0; if (std::getenv("STRATA_INK_VRAM_STAGES") && hipMemGetInfo(&f_,&t_)==hipSuccess) std::fprintf(stderr,"[vram-stage] %s free=%.0f MiB\n", "dspark", f_/1048576.0); }
         // 3. Load Section 4 experts in 3x loop-weighted vram_load_order priority!
         // Uses strata::hip_uma::alloc_gpu_buffer so 780M (gfx1103) & 890M (gfx1150) with small 512M-4G BIOS carveout
         // seamlessly allocate coherent GTT UMA memory and fit SQ-10 (9.75 GiB) & SQ-15 (13.36 GiB) 100% on GPU!
@@ -1779,6 +1914,7 @@ public:
         }
         const bool is_fp8 = (default_kv_dtype_ == KvDtype::FP8_E4M3);
 
+        { size_t f_=0,t_=0; if (std::getenv("STRATA_INK_VRAM_STAGES") && hipMemGetInfo(&f_,&t_)==hipSuccess) std::fprintf(stderr,"[vram-stage] %s free=%.0f MiB\n", "pre-kv", f_/1048576.0); }
         swa_pools_.resize(c_.n_swa_visits);
         for (int i = 0; i < c_.n_swa_visits; ++i) {
             if (!swa_pools_[i].init(true, is_fp8, mem_info_.is_uma, max_slots_, max_swa_pages, kv_dim, err)) return false;
@@ -1786,6 +1922,7 @@ public:
         glob_pools_.resize(c_.n_global_visits);
         for (int i = 0; i < c_.n_global_visits; ++i) {
             if (!glob_pools_[i].init(false, is_fp8, mem_info_.is_uma, max_slots_, max_glob_pages, kv_dim, err)) return false;
+            glob_pools_[i].on_tight = [this] { return !in_spec_ && evict_dspark(); };
         }
 
         const size_t kv_all_b = static_cast<size_t>(c_.n_visits) * max_slots_ * 3 * kv_dim * sizeof(uint16_t);
@@ -1840,6 +1977,138 @@ public:
         sl.tree_cool_rem = 0;
         clear_slot_sconv(slot);
         if (slot < static_cast<int>(ckpts_.size())) ckpts_[slot].valid = false;  // as in the CPU and CUDA backends
+        // A fresh sequence: give its global pages back so a finished long conversation does not pin VRAM.
+        bool any_vmm = false;
+        for (auto& p : glob_pools_) any_vmm = any_vmm || p.vmm;
+        if (any_vmm) {
+            (void)hipStreamSynchronize(stream_);
+            for (auto& p : glob_pools_) { p.free_slot_pages(slot); p.trim(); }
+        }
+        if (prefill_chunk_orig_ > 0) guard_.max_prefill_chunk = prefill_chunk_orig_;
+        if (ds_evicted_) (void)reload_dspark();
+    }
+
+    // Long context and the drafter compete for VRAM. The KV cache wins: when a global pool cannot grow, the drafter's
+    // weights go to host RAM and its context rings are freed (decode continues exactly, just without speculation). A
+    // fresh sequence brings it back if the trimmed pools left room for it. Output never changes, only speed.
+    void release_batch_scratch() {
+        (void)hipStreamSynchronize(stream_);
+        invalidate_graph();
+        free_gpu_buffer(sc_slot_ids_); free_gpu_buffer(sc_pos_); free_gpu_buffer(sc_tok_ids_); free_gpu_buffer(sc_img_idx_);
+        free_gpu_buffer(sc_want_idx_); free_gpu_buffer(sc_grp_slot_); free_gpu_buffer(sc_grp_off_); free_gpu_buffer(sc_grp_tok_);
+        free_gpu_buffer(sc_x_bf16_); free_gpu_buffer(sc_qkvrg_out_);
+        free_gpu_buffer(sc_cur_); free_gpu_buffer(sc_res_); free_gpu_buffer(sc_in0_); free_gpu_buffer(sc_in1_);
+        free_gpu_buffer(sc_in2_); free_gpu_buffer(sc_mx3_); free_gpu_buffer(sc_msgs_); free_gpu_buffer(sc_ctrl_tmp_);
+        free_gpu_buffer(sc_ctrl_in_); free_gpu_buffer(sc_ctrl_gain_); free_gpu_buffer(sc_ctrl_forget_);
+        free_gpu_buffer(sc_q_); free_gpu_buffer(sc_k_raw_); free_gpu_buffer(sc_v_raw_); free_gpu_buffer(sc_k_conv_);
+        free_gpu_buffer(sc_v_conv_); free_gpu_buffer(sc_r_raw_); free_gpu_buffer(sc_rel_bias_);
+        free_gpu_buffer(sc_sinks_); free_gpu_buffer(sc_gate_a_); free_gpu_buffer(sc_k_dyn_); free_gpu_buffer(sc_v_dyn_);
+        free_gpu_buffer(sc_attn_out_); free_gpu_buffer(sc_splitkv_part_); free_gpu_buffer(sc_o_proj_); free_gpu_buffer(sc_a_sconv_);
+        free_gpu_buffer(sc_mlp_in_); free_gpu_buffer(sc_mlp_f16_); free_gpu_buffer(sc_r_logits_);
+        free_gpu_buffer(sc_topk_ids_); free_gpu_buffer(sc_topk_w_); free_gpu_buffer(sc_moe_act_);
+        free_gpu_buffer(sc_moe_gu_); free_gpu_buffer(sc_moe_ye_); free_gpu_buffer(sc_moe_out_); free_gpu_buffer(sc_m_sconv_);
+        free_gpu_buffer(sc_exp_off_); free_gpu_buffer(sc_exp_cur_);
+        free_gpu_buffer(sc_x_q8_); free_gpu_buffer(sc_x_d_); free_gpu_buffer(sc_act_q8_); free_gpu_buffer(sc_act_d_);
+        free_gpu_buffer(sc_bucket_tok_); free_gpu_buffer(sc_slotk_bidx_);
+        free_gpu_buffer(sc_bucket_x_f16_); free_gpu_buffer(sc_bucket_y_);
+        free_gpu_buffer(sc_exp_tok_idx_); free_gpu_buffer(sc_exp_tok_w_); free_gpu_buffer(sc_h_norm_);
+        free_gpu_buffer(sc_blk_ptrs_); free_gpu_buffer(sc_prelude_); free_gpu_buffer(sc_bank_out_); free_gpu_buffer(sc_logits_);
+        for (auto& b : sc_blocks_) free_gpu_buffer(b);
+        for (auto& b : sc_bank_) free_gpu_buffer(b);
+        for (int k = 0; k < 4; ++k) free_gpu_buffer(sc_taps_[k]);
+        sc_blocks_.clear(); sc_bank_.clear();
+        scratch_B_ = 0;
+        sc_moe_gu_cap_ = 0;
+    }
+
+    // Between forwards: if the global KV pages this step may need do not fit in free VRAM, free the drafter, then
+    // drop prefill to 256-token chunks (about half the batch scratch). Returns true if it changed anything.
+    bool make_room(int need_pos) {
+        if (glob_pools_.empty() || mem_info_.is_uma) return false;
+        const int need_pages = need_pos / kKvPageTokens + 1;
+        size_t need = 0;
+        for (const auto& p : glob_pools_) {
+            if (p.host_offload || (!p.vmm && p.cap_pages > 0)) return false;
+            const int extra = need_pages - p.cap_pages;
+            if (extra > 0) need += static_cast<size_t>(extra + 32) * p.page_bytes() * 2u + (256u << 10);
+        }
+        if (need == 0) return false;
+        const size_t margin = 64ull << 20;
+        size_t vfree = 0, vtot = 0;
+        if (hipMemGetInfo(&vfree, &vtot) != hipSuccess || vfree >= need + margin) return false;
+        bool acted = false;
+        if (has_dspark_ && !ds_evicted_) {
+            acted = evict_dspark();
+            if (hipMemGetInfo(&vfree, &vtot) == hipSuccess && vfree >= need + margin) return acted;
+        }
+        if (guard_.max_prefill_chunk > 256) {
+            if (prefill_chunk_orig_ == 0) prefill_chunk_orig_ = guard_.max_prefill_chunk;
+            guard_.max_prefill_chunk = 256;
+            release_batch_scratch();
+            std::fprintf(stderr, "[ink-hip] long context: prefill chunk 256 from here (batch scratch shrunk for KV)\n");
+            acted = true;
+        }
+        return acted;
+    }
+
+    bool evict_dspark() {
+        if (!has_dspark_ || ds_evicted_) return false;
+        (void)hipStreamSynchronize(stream_);
+        size_t bytes = 0;
+        auto save = [&](GpuBuffer& b) {
+            if (!b.dev_ptr || b.host_mapped) return;
+            DsHostCopy c{&b, std::vector<uint8_t>(b.bytes)};
+            if (hipMemcpy(c.h.data(), b.dev_ptr, b.bytes, hipMemcpyDeviceToHost) != hipSuccess) { (void)hipGetLastError(); return; }
+            bytes += b.bytes;
+            free_gpu_buffer(b);
+            ds_host_.push_back(std::move(c));
+        };
+        for (auto& kv : dspark_bf16_) save(kv.second);
+        for (auto& kv : dspark_f32_) save(kv.second);
+        for (auto& b : dspark_qkv_) save(b);
+        for (auto& b : dspark_gu_) save(b);
+        for (int si = 0; si < max_slots_; ++si) {
+            auto& sl = slots_[si];
+            for (int i = 0; i < 3; ++i) { bytes += sl.dspark_k[i].bytes + sl.dspark_v[i].bytes; free_gpu_buffer(sl.dspark_k[i]); free_gpu_buffer(sl.dspark_v[i]); }
+            bytes += sl.dspark_frnn.bytes;
+            free_gpu_buffer(sl.dspark_frnn);
+            sl.dspark_cap = 0;
+            sl.dspark_len = 0;
+        }
+        invalidate_graph();
+        ++dspark_ptr_gen_;
+        has_dspark_ = false;
+        ds_evicted_ = true;
+        std::fprintf(stderr, "[ink-hip] long context: drafter moved off the GPU (%.0f MiB freed for KV); speculation paused until a new conversation\n",
+                     bytes / 1048576.0);
+        return true;
+    }
+
+    bool reload_dspark() {
+        if (!ds_evicted_) return true;
+        size_t need = 0;
+        for (const auto& c : ds_host_) need += c.h.size();
+        size_t vfree = 0, vtot = 0;
+        const size_t margin = (static_cast<size_t>(ds_ring_ > 0 ? ds_ring_ : 4096) * 17u << 10) + (512ull << 20);
+        if (hipMemGetInfo(&vfree, &vtot) != hipSuccess || vfree < need + margin) return false;
+        size_t done = 0;
+        for (; done < ds_host_.size(); ++done) {
+            auto& c = ds_host_[done];
+            if (alloc_gpu_buffer(*c.b, c.h.size(), false) != hipSuccess ||
+                hipMemcpy(c.b->dev_ptr, c.h.data(), c.h.size(), hipMemcpyHostToDevice) != hipSuccess) break;
+        }
+        if (done < ds_host_.size()) {
+            (void)hipGetLastError();
+            for (size_t i = 0; i <= done && i < ds_host_.size(); ++i) free_gpu_buffer(*ds_host_[i].b);
+            return false;
+        }
+        ds_host_.clear();
+        ds_evicted_ = false;
+        has_dspark_ = true;
+        invalidate_graph();
+        ++dspark_ptr_gen_;
+        std::fprintf(stderr, "[ink-hip] drafter back on the GPU (%.0f MiB)\n", need / 1048576.0);
+        return true;
     }
 
     void snapshot_slot(int slot) override {
@@ -2106,6 +2375,11 @@ public:
     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
         const int B_tot = batch.n_tokens;
         if (B_tot <= 0) return true;
+        {
+            int mx = 0;
+            for (int b = 0; b < B_tot; ++b) mx = std::max(mx, batch.pos[b]);
+            (void)make_room(mx);
+        }
         // A prompt checkpoint is only valid while nothing below its seq_len is written again.
         if (!ckpts_.empty()) {
             for (int b = 0; b < B_tot; ++b) {
@@ -2403,6 +2677,8 @@ public:
 #endif
         if (!has_dspark_ || max_emit <= 0 || out_emitted == nullptr) return 0;
         if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return 0;
+        if (make_room(anchor_pos + kTreeMaxM + 1) && !has_dspark_) return 0;
+        struct InSpec { bool& f; explicit InSpec(bool& x) : f(x) { f = true; } ~InSpec() { f = false; } } in_spec_guard(in_spec_);
         static const bool no_tree = [] { const char* e = std::getenv("STRATA_INK_NO_TREE"); return e && e[0] == '1'; }();
         if (no_tree) return 0;
         auto& sl = slots_[slot];
@@ -3758,6 +4034,16 @@ private:
         if (!rd.open(path, err)) return false;
         std::vector<uint8_t> s1;
         if (!rd.read_section(1, s1, err)) return false;
+        // Vision weights (~600 MiB) are used once per image: on discrete cards keep them in mapped host memory and give
+        // the VRAM to the KV cache. STRATA_INK_VISION_HOST=0 keeps them in VRAM.
+        const char* vh = std::getenv("STRATA_INK_VISION_HOST");
+        const bool vis_host = !mem_info_.is_uma && !(vh && vh[0] == '0');
+        auto upload_vis = [&](GpuBuffer& b, const void* src, size_t bytes) -> bool {
+            if (!vis_host) return upload_raw(b, src, bytes, err);
+            if (!hip_ok(alloc_gpu_buffer(b, bytes, false, /*prefer_uma_coherent=*/true), "vision host alloc", err)) return false;
+            std::memcpy(b.host_ptr, src, bytes);
+            return true;
+        };
 
         for (const auto& kv : vision_.info.T) {
             const auto& vt = kv.second;
@@ -3782,11 +4068,11 @@ private:
                      (vt.shape.size() >= 2 && vt.shape[0] >= 64 && (n / static_cast<size_t>(vt.shape[0])) >= 64)) {
                 auto bf = f32_vec_to_bf16(f32);
                 GpuBuffer b;
-                if (!upload_raw(b, bf.data(), bf.size() * 2, err)) return false;
+                if (!upload_vis(b, bf.data(), bf.size() * 2)) return false;
                 vision_.w_bf16[kv.first] = b;
             } else {
                 GpuBuffer b;
-                if (!upload_raw(b, f32.data(), f32.size() * 4, err)) return false;
+                if (!upload_vis(b, f32.data(), f32.size() * 4)) return false;
                 vision_.w_f32[kv.first] = b;
             }
         }
@@ -6435,6 +6721,11 @@ private:
     GpuBuffer d_tree_meta_, d_tree_k_, d_tree_v_;
     GpuBuffer d_tree_k8_, d_tree_v8_, d_tree_ks_, d_tree_vs_, d_tree_iota_, d_tree_zero_;
     bool tree_fp8_exact_ = false;
+    struct DsHostCopy { GpuBuffer* b; std::vector<uint8_t> h; };
+    std::vector<DsHostCopy> ds_host_;
+    bool ds_evicted_ = false;
+    bool in_spec_ = false;
+    int prefill_chunk_orig_ = 0;
     int ds_ring_ = 0;   // 0 = not decided, -1 = linear context, > 0 = ring size
     int ds_win(int swa_w) const {
         if (ds_ring_ <= 0) return swa_w;
