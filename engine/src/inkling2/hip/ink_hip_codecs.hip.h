@@ -2294,6 +2294,296 @@ __global__ void __launch_bounds__(256) k_bf16_gemv1_mr(
     }
 }
 
+// Q8_ROW dense weight -> 8 bf16 bit patterns, exactly as the load-time host conversion (f32_to_bf16((float)q * scale)).
+__device__ __forceinline__ uint32_t q8s_bf16(uint32_t w, int sh, float s) {
+    return static_cast<uint32_t>(f32_to_bf16(static_cast<float>(static_cast<int8_t>((w >> sh) & 0xFFu)) * s));
+}
+__device__ __forceinline__ uint4 q8row_load8(const int8_t* p, float s) {
+    const uint2 q = *reinterpret_cast<const uint2*>(p);
+    uint4 r;
+    r.x = q8s_bf16(q.x, 0, s) | (q8s_bf16(q.x, 8, s) << 16);
+    r.y = q8s_bf16(q.x, 16, s) | (q8s_bf16(q.x, 24, s) << 16);
+    r.z = q8s_bf16(q.y, 0, s) | (q8s_bf16(q.y, 8, s) << 16);
+    r.w = q8s_bf16(q.y, 16, s) | (q8s_bf16(q.y, 24, s) << 16);
+    return r;
+}
+__global__ void __launch_bounds__(256) k_q8row_to_bf16(const int8_t* __restrict__ W, const float* __restrict__ WS,
+                                                       uint16_t* __restrict__ out, int N, int K) {
+    const size_t i = (static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x) * 8;
+    if (i >= static_cast<size_t>(N) * K) return;
+    const int row = static_cast<int>(i / K);
+    *reinterpret_cast<uint4*>(out + i) = q8row_load8(W + i, WS[row]);
+}
+
+// ---- Q8_ROW clones of the M=1 / exact-rows BF16 GEMVs (same order of arithmetic) ----
+__global__ void __launch_bounds__(256) k_q8_gemv1_lds(
+    const int8_t* __restrict__ W, const float* __restrict__ WS,
+    const float* __restrict__ X,
+    const float* __restrict__ bias,
+    float* __restrict__ Y,
+    int N, int K) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+
+    __shared__ alignas(16) float sX[4096];
+    const int k4 = K >> 2;
+    const float4* x4 = reinterpret_cast<const float4*>(X);
+    float4* sx4 = reinterpret_cast<float4*>(sX);
+    for (int i = tid; i < k4; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    if (row >= N) return;
+    const int8_t* wr = W + static_cast<size_t>(row) * K;
+    const float ws = WS[row];
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const uint4 wb = q8row_load8(wr + k + 256, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        const float4 xb0 = *reinterpret_cast<const float4*>(sX + k + 256);
+        const float4 xb1 = *reinterpret_cast<const float4*>(sX + k + 260);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+        acc1 = fmaf(bf16_to_f32(wb.x & 0xFFFFu), xb0.x, fmaf(bf16_to_f32(wb.x >> 16), xb0.y,
+               fmaf(bf16_to_f32(wb.y & 0xFFFFu), xb0.z, fmaf(bf16_to_f32(wb.y >> 16), xb0.w, acc1))));
+        acc1 = fmaf(bf16_to_f32(wb.z & 0xFFFFu), xb1.x, fmaf(bf16_to_f32(wb.z >> 16), xb1.y,
+               fmaf(bf16_to_f32(wb.w & 0xFFFFu), xb1.z, fmaf(bf16_to_f32(wb.w >> 16), xb1.w, acc1))));
+    }
+    if (k < K) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+    }
+    const float sum = wave32_sum(acc0 + acc1) + (bias ? bias[row] : 0.0f);
+    if (lane == 0) Y[row] = sum;
+}
+
+__global__ void __launch_bounds__(256) k_q8_gemv1_qkvrg(
+    const int8_t* __restrict__ W, const float* __restrict__ WS,
+    const float* __restrict__ X,
+    float* __restrict__ Q,
+    float* __restrict__ R,
+    float* __restrict__ G,
+    float* __restrict__ K_out,
+    float* __restrict__ V_out,
+    const float* __restrict__ W_sink,   // nullptr or [n_sink, K] FP32
+    float* __restrict__ Sinks_out,      // nullptr or [n_sink] FP32
+    int q_dim, int r_dim, int kv_dim, int tot_n, int n_sink, int K) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+
+    __shared__ alignas(16) float sX[4096];
+    const int k4 = K >> 2;
+    const float4* x4 = reinterpret_cast<const float4*>(X);
+    float4* sx4 = reinterpret_cast<float4*>(sX);
+    for (int i = tid; i < k4; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    if (row >= tot_n + n_sink) return;
+    if (row >= tot_n) {
+        const int sr = row - tot_n;
+        const float4* w4 = reinterpret_cast<const float4*>(W_sink + static_cast<size_t>(sr) * K);
+        float acc = 0.0f;
+        for (int i = lane; i < k4; i += 32) {
+            const float4 wv = w4[i];
+            const float4 xv = sx4[i];
+            acc = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc))));
+        }
+        const float sum = wave32_sum(acc);
+        if (lane == 0) Sinks_out[sr] = sum;
+        return;
+    }
+
+    const int8_t* wr = W + static_cast<size_t>(row) * K;
+    const float ws = WS[row];
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const uint4 wb = q8row_load8(wr + k + 256, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        const float4 xb0 = *reinterpret_cast<const float4*>(sX + k + 256);
+        const float4 xb1 = *reinterpret_cast<const float4*>(sX + k + 260);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+        acc1 = fmaf(bf16_to_f32(wb.x & 0xFFFFu), xb0.x, fmaf(bf16_to_f32(wb.x >> 16), xb0.y,
+               fmaf(bf16_to_f32(wb.y & 0xFFFFu), xb0.z, fmaf(bf16_to_f32(wb.y >> 16), xb0.w, acc1))));
+        acc1 = fmaf(bf16_to_f32(wb.z & 0xFFFFu), xb1.x, fmaf(bf16_to_f32(wb.z >> 16), xb1.y,
+               fmaf(bf16_to_f32(wb.w & 0xFFFFu), xb1.z, fmaf(bf16_to_f32(wb.w >> 16), xb1.w, acc1))));
+    }
+    if (k < K) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+    }
+    const float sum = wave32_sum(acc0 + acc1);
+    if (lane == 0) {
+        if (row < q_dim) Q[row] = sum;
+        else if (row < q_dim + r_dim) R[row - q_dim] = sum;
+        else if (row < 2 * q_dim + r_dim) G[row - (q_dim + r_dim)] = sum;
+        else if (K_out && row < 2 * q_dim + r_dim + kv_dim) K_out[row - (2 * q_dim + r_dim)] = sum;
+        else if (V_out) V_out[row - (2 * q_dim + r_dim + kv_dim)] = sum;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_q8_gemv1_wo_sconv(
+    const int8_t* __restrict__ W, const float* __restrict__ WS,
+    const float* __restrict__ X,           // [K] FP32 (attn_out)
+    const float* __restrict__ static_w,    // [D, 4] FP32
+    const int32_t* __restrict__ slot_ids,  // [1]
+    uint16_t* __restrict__ hist_pool,      // [max_slots, 3, D] BF16
+    float* __restrict__ cur,               // [D] FP32 (updated in-place!)
+    float* __restrict__ blk_save,          // nullptr (non-boundary: cur += y) or [D] (boundary: blk_save=cur, cur=y)
+    int D, int K) {
+    // #6671: no FMA contraction here, so the fused and the separate forms of this step round alike (a verify window
+    // runs the separate form row by row; the one-token step runs the fused one)
+#pragma clang fp contract(off)
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+
+    __shared__ alignas(16) float sX[4096];
+    const int k4 = K >> 2;
+    const float4* x4 = reinterpret_cast<const float4*>(X);
+    float4* sx4 = reinterpret_cast<float4*>(sX);
+    for (int i = tid; i < k4; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    if (row >= D) return;
+    const int8_t* wr = W + static_cast<size_t>(row) * K;
+    const float ws = WS[row];
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const uint4 wb = q8row_load8(wr + k + 256, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        const float4 xb0 = *reinterpret_cast<const float4*>(sX + k + 256);
+        const float4 xb1 = *reinterpret_cast<const float4*>(sX + k + 260);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+        acc1 = fmaf(bf16_to_f32(wb.x & 0xFFFFu), xb0.x, fmaf(bf16_to_f32(wb.x >> 16), xb0.y,
+               fmaf(bf16_to_f32(wb.y & 0xFFFFu), xb0.z, fmaf(bf16_to_f32(wb.y >> 16), xb0.w, acc1))));
+        acc1 = fmaf(bf16_to_f32(wb.z & 0xFFFFu), xb1.x, fmaf(bf16_to_f32(wb.z >> 16), xb1.y,
+               fmaf(bf16_to_f32(wb.w & 0xFFFFu), xb1.z, fmaf(bf16_to_f32(wb.w >> 16), xb1.w, acc1))));
+    }
+    if (k < K) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const float4 xa0 = *reinterpret_cast<const float4*>(sX + k);
+        const float4 xa1 = *reinterpret_cast<const float4*>(sX + k + 4);
+        acc0 = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+               fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0))));
+        acc0 = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+               fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0))));
+    }
+    const float x0 = wave32_sum(acc0 + acc1);
+    if (lane == 0) {
+        const int slot = slot_ids[0];
+        uint16_t* h_slot = hist_pool + static_cast<size_t>(slot) * 3 * D;
+        const float h0 = bf16_to_f32(h_slot[0 * D + row]);
+        const float h1 = bf16_to_f32(h_slot[1 * D + row]);
+        const float h2 = bf16_to_f32(h_slot[2 * D + row]);
+        const float4 sw = *reinterpret_cast<const float4*>(static_w + static_cast<size_t>(row) * 4);
+        const float y = (x0 + sw.x * h0 + sw.y * h1 + sw.z * h2 + sw.w * x0) * 0.44721359549995793f;
+        h_slot[0 * D + row] = h_slot[1 * D + row];
+        h_slot[1 * D + row] = h_slot[2 * D + row];
+        h_slot[2 * D + row] = f32_to_bf16(x0);
+        if (blk_save != nullptr) {
+            blk_save[row] = cur[row];
+            cur[row] = y;
+        } else {
+            cur[row] += y;
+        }
+    }
+}
+
+template <int MT>
+__global__ void __launch_bounds__(256) k_q8_gemv1_mr(
+    const int8_t* __restrict__ W, const float* __restrict__ WS,
+    const float* __restrict__ X,
+    const float* __restrict__ bias,
+    float* __restrict__ Y,
+    int M, int N, int K) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 8 + wave;
+    if (row >= N) return;
+    const int8_t* wr = W + static_cast<size_t>(row) * K;
+    const float ws = WS[row];
+    float acc0[MT], acc1[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) { acc0[m] = 0.0f; acc1[m] = 0.0f; }
+    int k = lane * 8;
+    for (; k + 256 < K; k += 512) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+        const uint4 wb = q8row_load8(wr + k + 256, ws);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m < M) {
+                const float* xp = X + static_cast<size_t>(m) * K;
+                const float4 xa0 = *reinterpret_cast<const float4*>(xp + k);
+                const float4 xa1 = *reinterpret_cast<const float4*>(xp + k + 4);
+                const float4 xb0 = *reinterpret_cast<const float4*>(xp + k + 256);
+                const float4 xb1 = *reinterpret_cast<const float4*>(xp + k + 260);
+                acc0[m] = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+                          fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0[m]))));
+                acc0[m] = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+                          fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0[m]))));
+                acc1[m] = fmaf(bf16_to_f32(wb.x & 0xFFFFu), xb0.x, fmaf(bf16_to_f32(wb.x >> 16), xb0.y,
+                          fmaf(bf16_to_f32(wb.y & 0xFFFFu), xb0.z, fmaf(bf16_to_f32(wb.y >> 16), xb0.w, acc1[m]))));
+                acc1[m] = fmaf(bf16_to_f32(wb.z & 0xFFFFu), xb1.x, fmaf(bf16_to_f32(wb.z >> 16), xb1.y,
+                          fmaf(bf16_to_f32(wb.w & 0xFFFFu), xb1.z, fmaf(bf16_to_f32(wb.w >> 16), xb1.w, acc1[m]))));
+            }
+        }
+    }
+    if (k < K) {
+        const uint4 wa = q8row_load8(wr + k, ws);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            if (m < M) {
+                const float* xp = X + static_cast<size_t>(m) * K;
+                const float4 xa0 = *reinterpret_cast<const float4*>(xp + k);
+                const float4 xa1 = *reinterpret_cast<const float4*>(xp + k + 4);
+                acc0[m] = fmaf(bf16_to_f32(wa.x & 0xFFFFu), xa0.x, fmaf(bf16_to_f32(wa.x >> 16), xa0.y,
+                          fmaf(bf16_to_f32(wa.y & 0xFFFFu), xa0.z, fmaf(bf16_to_f32(wa.y >> 16), xa0.w, acc0[m]))));
+                acc0[m] = fmaf(bf16_to_f32(wa.z & 0xFFFFu), xa1.x, fmaf(bf16_to_f32(wa.z >> 16), xa1.y,
+                          fmaf(bf16_to_f32(wa.w & 0xFFFFu), xa1.z, fmaf(bf16_to_f32(wa.w >> 16), xa1.w, acc0[m]))));
+            }
+        }
+    }
+    const float bv = bias ? bias[row] : 0.0f;
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        const float sum = wave32_sum(acc0[m] + acc1[m]) + bv;
+        if (lane == 0 && m < M) Y[static_cast<size_t>(m) * N + row] = sum;
+    }
+}
+
+
 // Skinny Native Hardware BF16 WMMA (BM=16, BN=32 or 64, BK=64) for M=9..16 or small-N controllers (N=64)!
 // BN=64 uses 128 threads (4 waves), BN=32 uses 64 threads (2 waves) -> saturates 32-40 CUs even for N=1024!
 template <int BN>

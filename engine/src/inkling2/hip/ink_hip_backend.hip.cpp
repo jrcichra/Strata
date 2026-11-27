@@ -87,6 +87,15 @@ __global__ void __launch_bounds__(256) k_bf16_to_f32_vec(const uint16_t* src, fl
     if (i < n) dst[i] = strata::inkling2::hip::bf16_to_f32(src[i]);
 }
 
+struct DenseQ8 { GpuBuffer q; GpuBuffer s; size_t rows = 0, cols = 0; };
+struct DW {
+    const uint16_t* bf = nullptr; const int8_t* q = nullptr; const float* s = nullptr;
+    DW rows_from(size_t r, int K) const { DW o = *this; if (bf) o.bf = bf + r * K; else { o.q = q + r * K; o.s = s + r; } return o; }
+};
+#define INK_QKVRG1(grid, wc, ...) do { if ((wc).bf) k_bf16_gemv1_qkvrg<<<(grid), 256, 0, stream_>>>((wc).bf, __VA_ARGS__); \
+    else k_q8_gemv1_qkvrg<<<(grid), 256, 0, stream_>>>((wc).q, (wc).s, __VA_ARGS__); } while (0)
+#define INK_WO1(grid, wc, ...) do { if ((wc).bf) k_bf16_gemv1_wo_sconv<<<(grid), 256, 0, stream_>>>((wc).bf, __VA_ARGS__); \
+    else k_q8_gemv1_wo_sconv<<<(grid), 256, 0, stream_>>>((wc).q, (wc).s, __VA_ARGS__); } while (0)
 __global__ void __launch_bounds__(256) k_f32_to_bf16_vec(const float* src, uint16_t* dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = strata::inkling2::hip::f32_to_bf16(src[i]);
@@ -911,6 +920,26 @@ public:
                 pt.info = ti;
                 if (!upload_raw(pt.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
                 packed_trunk_[name] = pt;
+            } else if (is_large_2d_matmul(name, ti) && dense_q8_eligible(model, name, ti)) {
+                const size_t rows = static_cast<size_t>(ti.rows()), cols = static_cast<size_t>(ti.cols());
+                DenseQ8 d;
+                if (!upload_raw(d.s, sec1.data() + ti.off, rows * sizeof(float), err)) return false;
+                if (!upload_raw(d.q, sec1.data() + ti.off + rows * sizeof(float), rows * cols, err)) return false;
+                d.rows = rows; d.cols = cols;
+                trunk_q8_[name] = d;
+                if (std::getenv("STRATA_INK_Q8_SELFTEST")) {
+                    auto ref = f32_vec_to_bf16(decode_sec1_f32(sec1.data(), ti));
+                    GpuBuffer tb; (void)alloc_gpu_buffer(tb, ref.size() * 2, false);
+                    const size_t n8 = (ref.size() + 7) / 8;
+                    k_q8row_to_bf16<<<static_cast<unsigned>((n8 + 255) / 256), 256>>>(reinterpret_cast<const int8_t*>(d.q.dev_ptr), reinterpret_cast<const float*>(d.s.dev_ptr), reinterpret_cast<uint16_t*>(tb.dev_ptr), (int)rows, (int)cols);
+                    std::vector<uint16_t> got(ref.size());
+                    (void)hipMemcpy(got.data(), tb.dev_ptr, got.size() * 2, hipMemcpyDeviceToHost);
+                    size_t bad = 0, first = (size_t)-1;
+                    for (size_t i = 0; i < ref.size(); ++i) if (got[i] != ref[i]) { if (!bad) first = i; ++bad; }
+                    std::fprintf(stderr, "[q8-selftest] %s rows=%zu cols=%zu bytes=%llu bad=%zu first=%zd ref=%04x got=%04x\n", name.c_str(), rows, cols,
+                                 (unsigned long long)ti.bytes, bad, (ssize_t)first, bad ? ref[first] : 0, bad ? got[first] : 0);
+                    free_gpu_buffer(tb);
+                }
             } else if (is_large_2d_matmul(name, ti)) {
                 auto f32 = decode_sec1_f32(sec1.data(), ti);
                 auto bf16 = f32_vec_to_bf16(f32);
@@ -1016,6 +1045,45 @@ public:
                     trunk_qkvrg_[il] = cat;
                 }
             }
+        }
+        trunk_qkvrg_q8_.resize(c_.n_phys);
+        for (int il = 0; il < c_.n_phys; ++il) {
+            const std::string p = "model.llm.layers." + std::to_string(il) + ".attn.";
+            const std::string ks[5] = {
+                p + "wq_du.weight", p + "wr_du.weight", p + "gate_attn.weight",
+                p + "wk_dv.weight", p + "wv_dv.weight"
+            };
+            bool all_q8 = true;
+            size_t tq = 0, ts = 0;
+            for (int j = 0; j < 5; ++j) {
+                auto it = trunk_q8_.find(ks[j]);
+                if (it == trunk_q8_.end()) { all_q8 = false; break; }
+                tq += it->second.rows * it->second.cols; ts += it->second.rows * sizeof(float);
+            }
+            if (!all_q8) continue;
+            DenseQ8 cat;
+            if (!hip_ok(alloc_gpu_buffer(cat.q, tq, mem_info_.is_uma), "q8 cat", err) ||
+                !hip_ok(alloc_gpu_buffer(cat.s, ts, mem_info_.is_uma), "q8 cat s", err)) return false;
+            size_t oq = 0, os = 0;
+            for (int j = 0; j < 5; ++j) {
+                auto& d = trunk_q8_.at(ks[j]);
+                const size_t qb = d.rows * d.cols, sb = d.rows * sizeof(float);
+                (void)hipMemcpy(cat.q.dev_ptr + oq, d.q.dev_ptr, qb, hipMemcpyDeviceToDevice);
+                (void)hipMemcpy(cat.s.dev_ptr + os, d.s.dev_ptr, sb, hipMemcpyDeviceToDevice);
+                oq += qb; os += sb;
+                cat.cols = d.cols; cat.rows += d.rows;
+                free_gpu_buffer(d.q); free_gpu_buffer(d.s);
+                trunk_q8_.erase(ks[j]);
+            }
+            trunk_qkvrg_q8_[il] = cat;
+        }
+        {   // prefill expands one Q8 matrix at a time into this bf16 scratch; size it now, not inside a forward
+            size_t mx = 0;
+            for (const auto& kv : trunk_q8_) mx = std::max(mx, kv.second.rows * kv.second.cols * 2);
+            for (const auto& d : trunk_qkvrg_q8_) mx = std::max(mx, d.rows * d.cols * 2);
+            if (mx > 0 && !hip_ok(alloc_gpu_buffer(sc_dense_bf16_, mx, mem_info_.is_uma), "dense q8 scratch", err)) return false;
+            if (mx > 0) std::fprintf(stderr, "[ink-hip] dense Q8_ROW trunk kept int8 in VRAM (%zu tensors + %d fused qkvrg), bf16 scratch %.1f MiB\n",
+                                     trunk_q8_.size(), (int)std::count_if(trunk_qkvrg_q8_.begin(), trunk_qkvrg_q8_.end(), [](const DenseQ8& d){ return d.q.dev_ptr != nullptr; }), mx / 1048576.0);
         }
 
         // 2. Load embedded DSpark tensors to GPU if present & enabled
@@ -3227,7 +3295,79 @@ private:
         }
     }
 
+    // STRATA_INK_DENSE_Q8=0 restores the old BF16 expansion of Q8_ROW attention projections.
+    bool dense_q8_eligible(const InkModelFile& model, const std::string& name, const TInfo& ti) const {
+        if (!dense_q8_ || ti.fmt != F_Q8ROW || ti.shape.size() != 2) return false;
+        if ((ti.cols() & 7) != 0) return false;
+        static const char* kq[5] = {"wq_du.weight", "wr_du.weight", "gate_attn.weight", "wk_dv.weight", "wv_dv.weight"};
+        const size_t at = name.rfind(".attn.");
+        if (at == std::string::npos) return false;
+        const std::string tail = name.substr(at + 6), pre = name.substr(0, at + 6);
+        const char* dm = std::getenv("STRATA_INK_DENSE_Q8");
+        if (tail == "wo_ud.weight") return !(dm && dm[0] == '3');
+        if (dm && dm[0] == '2') return false;
+        bool member = false;
+        for (const char* t : kq) member |= (tail == t);
+        if (!member) return false;
+        for (const char* t : kq) {
+            auto it = model.m.trunk.find(pre + t);
+            if (it == model.m.trunk.end() || it->second.fmt != F_Q8ROW || !is_large_2d_matmul(pre + t, it->second)) return false;
+        }
+        return true;
+    }
+    bool has_qkvrg(int ip) const { return trunk_qkvrg_[ip].dev_ptr != nullptr || (ip < (int)trunk_qkvrg_q8_.size() && trunk_qkvrg_q8_[ip].q.dev_ptr != nullptr); }
+    DW qkvrg_w(int ip) const {
+        DW w;
+        if (trunk_qkvrg_[ip].dev_ptr) w.bf = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
+        else { w.q = reinterpret_cast<const int8_t*>(trunk_qkvrg_q8_[ip].q.dev_ptr); w.s = reinterpret_cast<const float*>(trunk_qkvrg_q8_[ip].s.dev_ptr); }
+        return w;
+    }
+    bool has_dense(const std::string& k) const { return trunk_bf16_.count(k) > 0 || trunk_q8_.count(k) > 0; }
+    DW dense_w(const std::string& k) const {
+        DW w;
+        auto it = trunk_bf16_.find(k);
+        if (it != trunk_bf16_.end()) { w.bf = reinterpret_cast<const uint16_t*>(it->second.dev_ptr); return w; }
+        const auto& d = trunk_q8_.at(k);
+        w.q = reinterpret_cast<const int8_t*>(d.q.dev_ptr); w.s = reinterpret_cast<const float*>(d.s.dev_ptr);
+        return w;
+    }
+    void launch_q8_m1(const DW& w, const float* X, const float* bias, float* Y, int N, int K) {
+        k_q8_gemv1_lds<<<(N + 7) / 8, 256, 0, stream_>>>(w.q, w.s, X, bias, Y, N, K);
+    }
+    // Same kernel choice as launch_bf16_opt, with the weights read as int8 and rebuilt to the identical bf16 bits.
+    void launch_dense(const DW& w, const float* X, const float* bias, float* Y, int M, int N, int K) {
+        if (w.bf) { launch_bf16_opt(w.bf, X, bias, Y, M, N, K); return; }
+        if (K <= 4096 && (K & 7) == 0) {
+            if (M == 1) { launch_q8_m1(w, X, bias, Y, N, K); return; }
+            if (exact_rows_ && M <= 16) {
+                for (int m0 = 0; m0 < M; m0 += 8) {
+                    const int mc = (M - m0) < 8 ? (M - m0) : 8;
+                    const float* xs = X + static_cast<size_t>(m0) * K;
+                    float* ys = Y + static_cast<size_t>(m0) * N;
+                    const dim3 grid((N + 7) / 8);
+                    if (mc == 1)      launch_q8_m1(w, xs, bias, ys, N, K);
+                    else if (mc <= 2) k_q8_gemv1_mr<2><<<grid, 256, 0, stream_>>>(w.q, w.s, xs, bias, ys, mc, N, K);
+                    else if (mc <= 4) k_q8_gemv1_mr<4><<<grid, 256, 0, stream_>>>(w.q, w.s, xs, bias, ys, mc, N, K);
+                    else if (mc <= 6) k_q8_gemv1_mr<6><<<grid, 256, 0, stream_>>>(w.q, w.s, xs, bias, ys, mc, N, K);
+                    else              k_q8_gemv1_mr<8><<<grid, 256, 0, stream_>>>(w.q, w.s, xs, bias, ys, mc, N, K);
+                }
+                return;
+            }
+        }
+        // prefill / wide batches: expand this one matrix into scratch (bit-identical bf16), then the usual kernels
+        const size_t need = static_cast<size_t>(N) * K * sizeof(uint16_t);
+        if (sc_dense_bf16_.bytes < need) {
+            free_gpu_buffer(sc_dense_bf16_);
+            (void)alloc_gpu_buffer(sc_dense_bf16_, need, mem_info_.is_uma);
+        }
+        uint16_t* tmp = reinterpret_cast<uint16_t*>(sc_dense_bf16_.dev_ptr);
+        const size_t n8 = (static_cast<size_t>(N) * K + 7) / 8;
+        k_q8row_to_bf16<<<static_cast<unsigned>((n8 + 255) / 256), 256, 0, stream_>>>(w.q, w.s, tmp, N, K);
+        launch_bf16_opt(tmp, X, bias, Y, M, N, K);
+    }
+
     void launch_trunk_linear(const std::string& key, const float* X, float* Y, int M, int N, int K) {
+        if (trunk_q8_.count(key)) { launch_dense(dense_w(key), X, nullptr, Y, M, N, K); return; }
         auto it_bf = trunk_bf16_.find(key);
         if (it_bf != trunk_bf16_.end()) {
             launch_bf16_opt(reinterpret_cast<const uint16_t*>(it_bf->second.dev_ptr), X, nullptr, Y, M, N, K);
@@ -3253,6 +3393,9 @@ private:
         tot += hybrid_.allocated_bytes();
         for (const auto& b : trunk_qkvrg_) tot += b.bytes;
         for (const auto& kv : trunk_bf16_) tot += kv.second.bytes;
+        for (const auto& kv : trunk_q8_) tot += kv.second.q.bytes + kv.second.s.bytes;
+        for (const auto& d : trunk_qkvrg_q8_) tot += d.q.bytes + d.s.bytes;
+        tot += sc_dense_bf16_.bytes;
         for (const auto& kv : trunk_f32_) tot += kv.second.bytes;
         for (const auto& kv : packed_trunk_) tot += kv.second.buf.bytes;
         for (const auto& kv : static_sconv_) tot += kv.second.bytes;
@@ -4081,21 +4224,21 @@ private:
             const int r_dim = c_.n_head * c_.d_rel;
             bool sink_done = false;
             const bool sink_is_f32 = (trunk_bf16_.count(p + ".attn.attn_sink_proj.weight") == 0);
-            if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
-                const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
+            if (has_qkvrg(ip)) {
+                const DW w_cat = qkvrg_w(ip);
                 float* cat_out = reinterpret_cast<float*>(sc_qkvrg_out_.dev_ptr);
                 if (!has_msgs && is_swa) {
                     const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
-                        k_bf16_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
-                            w_cat, q_in, q, r_raw, gatea, k_raw, v_raw,
+                        INK_QKVRG1((tot_n + ns + 7) / 8, w_cat,
+                             q_in, q, r_raw, gatea, k_raw, v_raw,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
                             sink_is_f32 ? sinks : nullptr,
                             q_dim, r_dim, kv_dim, tot_n, ns, D);
                         sink_done = sink_is_f32;
                     } else {
-                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
+                        launch_dense(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
                         k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
                             cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
                     }
@@ -4103,19 +4246,19 @@ private:
                     const int qrg_n = 2 * q_dim + r_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
-                        k_bf16_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
-                            w_cat, q_in, q, r_raw, gatea, nullptr, nullptr,
+                        INK_QKVRG1((qrg_n + ns + 7) / 8, w_cat,
+                             q_in, q, r_raw, gatea, nullptr, nullptr,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
                             sink_is_f32 ? sinks : nullptr,
                             q_dim, r_dim, kv_dim, qrg_n, ns, D);
                         sink_done = sink_is_f32;
                     } else {
-                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
+                        launch_dense(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
                         k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
                             cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
                     }
-                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
-                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
+                    launch_dense(w_cat.rows_from(qrg_n, D), k_in, nullptr, k_raw, B, kv_dim, D);
+                    launch_dense(w_cat.rows_from(qrg_n + kv_dim, D), v_in, nullptr, v_raw, B, kv_dim, D);
                 }
             } else {
                 launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q,     B, q_dim, D);
@@ -4125,7 +4268,7 @@ private:
                 launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
             }
             if (!sink_done) {
-                if (exact_rows_ && B >= 2 && sink_is_f32 && trunk_qkvrg_[ip].dev_ptr != nullptr && D <= 4096 && (D & 7) == 0) {
+                if (exact_rows_ && B >= 2 && sink_is_f32 && has_qkvrg(ip) && D <= 4096 && (D & 7) == 0) {
                     // the one-token step projects the sinks inside k_bf16_gemv1_qkvrg: same arithmetic per row
                     launch_f32_sink_rows_exact(f32_ptr(p + ".attn.attn_sink_proj.weight"), q_in, sinks, B, c_.n_head, D, stream_);
                 } else {
@@ -4294,7 +4437,7 @@ private:
             if (visit == 0) { dbg_hash(196, aout, B, q_dim); dbg_hash(193, q, B, q_dim); dbg_hash(194, k_cv, B, kv_dim); dbg_hash(195, v_cv, B, kv_dim); dbg_hash(197, k_raw, B, kv_dim); dbg_hash(198, sinks, B, c_.n_head); dbg_hash(199, gatea, B, q_dim); dbg_hash(200, rbias, B, c_.n_head * c_.rel_extent); dbg_hash(201, r_raw, B, c_.n_head * c_.d_rel); }
             pmark(4);
             const std::string wo_key = p + ".attn.wo_ud.weight";
-            if (B == 1 && all_distinct_slots && rec_slot < 0 && q_dim <= 4096 && (q_dim & 7) == 0 && trunk_bf16_.count(wo_key) > 0) {
+            if (B == 1 && all_distinct_slots && rec_slot < 0 && q_dim <= 4096 && (q_dim & 7) == 0 && has_dense(wo_key)) {
                 const size_t vstride = static_cast<size_t>(max_slots_) * 3u * static_cast<size_t>(D) * sizeof(uint16_t);
                 float* bsave = nullptr;
                 if (ip % c_.block_size == 0) {
@@ -4302,8 +4445,8 @@ private:
                     blk_ptrs.push_back(bsave);
                     ++n_blocks;
                 }
-                k_bf16_gemv1_wo_sconv<<<(D + 7) / 8, 256, 0, stream_>>>(
-                    bf16_ptr(wo_key), aout,
+                const DW wo_w = dense_w(wo_key);
+                INK_WO1((D + 7) / 8, wo_w, aout,
                     reinterpret_cast<const float*>(static_sconv_.at(p + ".attn_sconv").dev_ptr),
                     reinterpret_cast<const int32_t*>(sc_slot_ids_.dev_ptr),
                     reinterpret_cast<uint16_t*>(d_sconv_attn_all_.dev_ptr + visit * vstride),
@@ -5501,21 +5644,21 @@ private:
             const int r_dim = c_.n_head * c_.d_rel;
             bool sink_done = false;
             const bool sink_is_f32 = (trunk_bf16_.count(p + ".attn.attn_sink_proj.weight") == 0);
-            if (trunk_qkvrg_[ip].dev_ptr != nullptr) {
-                const uint16_t* w_cat = reinterpret_cast<const uint16_t*>(trunk_qkvrg_[ip].dev_ptr);
+            if (has_qkvrg(ip)) {
+                const DW w_cat = qkvrg_w(ip);
                 float* cat_out = reinterpret_cast<float*>(sc_qkvrg_out_.dev_ptr);
                 if (!has_msgs && is_swa) {
                     const int tot_n = 2 * q_dim + r_dim + 2 * kv_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
-                        k_bf16_gemv1_qkvrg<<<(tot_n + ns + 7) / 8, 256, 0, stream_>>>(
-                            w_cat, q_in, q, r_raw, gatea, k_raw, v_raw,
+                        INK_QKVRG1((tot_n + ns + 7) / 8, w_cat,
+                             q_in, q, r_raw, gatea, k_raw, v_raw,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
                             sink_is_f32 ? sinks : nullptr,
                             q_dim, r_dim, kv_dim, tot_n, ns, D);
                         sink_done = sink_is_f32;
                     } else {
-                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
+                        launch_dense(w_cat, q_in, nullptr, cat_out, B, tot_n, D);
                         k_split_qkvrg<<<dim3(((tot_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
                             cat_out, q, r_raw, gatea, k_raw, v_raw, B, q_dim, r_dim, kv_dim, tot_n);
                     }
@@ -5523,19 +5666,19 @@ private:
                     const int qrg_n = 2 * q_dim + r_dim;
                     if (B == 1 && D <= 4096 && (D & 7) == 0) {
                         const int ns = sink_is_f32 ? c_.n_head : 0;
-                        k_bf16_gemv1_qkvrg<<<(qrg_n + ns + 7) / 8, 256, 0, stream_>>>(
-                            w_cat, q_in, q, r_raw, gatea, nullptr, nullptr,
+                        INK_QKVRG1((qrg_n + ns + 7) / 8, w_cat,
+                             q_in, q, r_raw, gatea, nullptr, nullptr,
                             sink_is_f32 ? f32_ptr(p + ".attn.attn_sink_proj.weight") : nullptr,
                             sink_is_f32 ? sinks : nullptr,
                             q_dim, r_dim, kv_dim, qrg_n, ns, D);
                         sink_done = sink_is_f32;
                     } else {
-                        launch_bf16_opt(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
+                        launch_dense(w_cat, q_in, nullptr, cat_out, B, qrg_n, D);
                         k_split_qkvrg<<<dim3(((qrg_n >> 2) + 255) / 256, B), 256, 0, stream_>>>(
                             cat_out, q, r_raw, gatea, nullptr, nullptr, B, q_dim, r_dim, kv_dim, qrg_n);
                     }
-                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n) * D, k_in, nullptr, k_raw, B, kv_dim, D);
-                    launch_bf16_opt(w_cat + static_cast<size_t>(qrg_n + kv_dim) * D, v_in, nullptr, v_raw, B, kv_dim, D);
+                    launch_dense(w_cat.rows_from(qrg_n, D), k_in, nullptr, k_raw, B, kv_dim, D);
+                    launch_dense(w_cat.rows_from(qrg_n + kv_dim, D), v_in, nullptr, v_raw, B, kv_dim, D);
                 }
             } else {
                 launch_trunk_linear(p + ".attn.wq_du.weight", q_in, q, B, q_dim, D);
@@ -5545,7 +5688,7 @@ private:
                 launch_trunk_linear(p + ".attn.gate_attn.weight", q_in, gatea, B, q_dim, D);
             }
             if (!sink_done) {
-                if (exact_rows_ && B >= 2 && sink_is_f32 && trunk_qkvrg_[ip].dev_ptr != nullptr && D <= 4096 && (D & 7) == 0) {
+                if (exact_rows_ && B >= 2 && sink_is_f32 && has_qkvrg(ip) && D <= 4096 && (D & 7) == 0) {
                     // the one-token step projects the sinks inside k_bf16_gemv1_qkvrg: same arithmetic per row
                     launch_f32_sink_rows_exact(f32_ptr(p + ".attn.attn_sink_proj.weight"), q_in, sinks, B, c_.n_head, D, stream_);
                 } else {
@@ -5929,6 +6072,11 @@ private:
         free_gpu_buffer(d_sconv_k_all_); free_gpu_buffer(d_sconv_v_all_);
         free_gpu_buffer(d_sconv_attn_all_); free_gpu_buffer(d_sconv_mlp_all_);
         for (auto& b : trunk_qkvrg_) free_gpu_buffer(b);
+        for (auto& d : trunk_qkvrg_q8_) { free_gpu_buffer(d.q); free_gpu_buffer(d.s); }
+        trunk_qkvrg_q8_.clear();
+        for (auto& kv : trunk_q8_) { free_gpu_buffer(kv.second.q); free_gpu_buffer(kv.second.s); }
+        trunk_q8_.clear();
+        free_gpu_buffer(sc_dense_bf16_);
         trunk_qkvrg_.clear();
         for (auto& kv : trunk_bf16_) free_gpu_buffer(kv.second);
         for (auto& kv : trunk_f32_) free_gpu_buffer(kv.second);
@@ -6034,6 +6182,7 @@ private:
     // layer uses the kernels whose row m is the value the one-token step gives (launch_bf16_rows_exact).  STRATA_INK_EXACT_ROWS=0 turns it off.
     bool exact_rows_ = false;
     bool exact_verify_enabled_ = true;
+    bool dense_q8_ = (std::getenv("STRATA_INK_DENSE_Q8") == nullptr || std::getenv("STRATA_INK_DENSE_Q8")[0] != '0');
     // #6671 diagnostics (STRATA_INK_HASH=1): per row hashes of cur before the MoE (slot 4v), mlpin (4v+1), the router logits (4v+3),
     // cur at the end of the visit (4v+2) and the final norm (192), printed as [HASH] lines by dbg_hash_print.
     bool dbg_hash_on_ = false;
@@ -6070,6 +6219,9 @@ private:
     int swa_span_cap_ = 0;  // max tokens per forward_batch_chunk so the ring margin holds (0 = no extra cap)
 
     std::vector<GpuBuffer> trunk_qkvrg_;
+    std::unordered_map<std::string, DenseQ8> trunk_q8_;
+    std::vector<DenseQ8> trunk_qkvrg_q8_;
+    GpuBuffer sc_dense_bf16_;
     std::unordered_map<std::string, GpuBuffer> trunk_bf16_;
     std::unordered_map<std::string, GpuBuffer> trunk_f32_;
     std::unordered_map<std::string, GpuPackedTensor> packed_trunk_;
