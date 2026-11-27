@@ -19,7 +19,61 @@ Numbers are this machine only; nothing here is a statement about other AMD cards
   LUT on top of `2460e04a3`; `427074dd4` makes greedy decoding the default; `6a6f3907f` adds serving-side hybrid KV. The OPEN speculative-path item below still applies to this build. Those two
   changes touch FP8 attention and grouped-W13 weight unpacking only.
 
-## OPEN -- possible correctness regression in `2460e04a3`; do not treat its "bit-identical" label as settled
+## 2026-11-27: 128K context fits on the card; speculation is lossless again (read this first)
+
+This section supersedes the **OPEN** item and the **hybrid KV is the serving default** section below; both
+are kept as history. Commits `6f9a45d63` .. `378bf78bb` on top of `6a6f3907f`.
+
+**Why serving hung.** With `--kv fp16 --hybrid-kv`, the drafter and the vision tower in VRAM, post-load free
+VRAM was 982 MiB. Global KV pages then spilled to host-mapped pinned memory over the ~3.9 GB/s Thunderbolt
+link (`Global KV pool VRAM tight ... spilled to host-mapped pinned KV`) and every step crawled, which is what a
+Pi agent session saw as a hang. Hybrid KV also needed two KV copies at once.
+
+**Serving profile now** (`deploy/profile.local-engine.json`): `--kv fp8`, no `--hybrid-kv`, `--draft dspark`,
+`--max-context 131072`, vision on, `--vram-experts-gb 8.77 --ram-experts-gb 0`.
+
+| change | commit | VRAM / effect | exactness |
+|---|---|---|---|
+| Q8_ROW attention projections kept int8 (no bf16 expansion) | `6f9a45d63` | half the bytes of the bf16 copy | KLD 0 |
+| input embedding + DSpark markov table in mapped host RAM | `0ba02b894` | ~640 MiB back | KLD 0 |
+| FP8 tree verify uses the one-token step's kernels | `9b25461c5` | fixes the OPEN item: spec-check 512/2048 `identical` (was `DIFFERS` at token 24) | lossless |
+| tree gate on measured step times (must beat plain decode) | `b8fb1bc97` | speculation no longer runs when it loses | output unaffected |
+| DSpark context as an 8K ring | `0b8ce54d5` | 2.1 GiB -> 136 MiB at 128K | draft only; verify exact |
+| global KV pools grow in place (HIP virtual memory, 2 MiB chunks), unmapped on slot reset | `1251e0661` | no old+new copy on grow, stable pointers | KLD 0 |
+| drafter evicted to host RAM when KV needs the room, back on a new conversation; then prefill chunk 256 | `1251e0661` | +640 MiB, then +~195 MiB | output unchanged, only speculation pauses |
+| vision tower weights in mapped host RAM | `1251e0661` | ~600 MiB back; red-image check still "red" (~6.5 s) | exact |
+| tiled FP32 prefill attention for RDNA2 | `1a49a7bb7` | 32K prefill 120 -> 180 tok/s | see below |
+| up to 16 KV splits past 8K + GQA-shared split kernel past 8K | `b725bb6d7`, `378bf78bb` | 32K decode 28.8 -> 32.5 tok/s | bit-identical (KLD 0, spec-check 2K/17K identical) |
+
+Load-stage VRAM (`STRATA_INK_VRAM_STAGES=1`): trunk + HIP context ~1.4 GiB, drafter 530 MiB, experts 8.0 GiB,
+2106 MiB left for KV + scratch. Moving experts to RAM is not an option: 0.5 GiB of experts in RAM cut prefill
+196 -> 80 tok/s and decode 39 -> 23 tok/s.
+
+**The one non-bit-exact change: tiled prefill attention.** Exact FP32, per-visit outputs match the old kernel to
+~1e-6 relative (`STRATA_INK_TILED_CHECK=1` prints the comparison), but the summation order differs, and this
+model (48 looped visits, top-k MoE routing) turns last-bit rounding into occasional routing flips: Mean KLD 0.0015,
+Top-1 99.2-99.4%, PPL 6.902 -> 6.914 (2K) and 1101.4 -> 1100.5 (512). `STRATA_INK_TILED_ATTN=0` restores
+bit-identical prefill. Decode and speculation are bit-identical to the old reference either way.
+
+Bench (prompt N, gen 128-256, `--draft off` unless noted, `--max-context 131072`):
+
+| prompt | prefill tok/s | decode tok/s |
+|---:|---:|---:|
+| 2048 | 226.7 | 38.8 (60.7 with `--draft dspark`) |
+| 8192 | 212.9 | 36.2 (40.4 with dspark, measured before the attention kernel changes) |
+| 32768 | 179.7 | 32.5 |
+| 130500 | 103.5 (was 55.5; 21 min) | 22.5 (was 16.2), drafter evicted, no host spill |
+
+HTTP through the server (short prompts, speculation on): 42-48 tok/s decode, TTFT 0.5-0.8 s.
+
+Switches: `STRATA_INK_KV_VMM=0`, `STRATA_INK_DSPARK_CTX=<n>` (ring size, default 8192), `STRATA_INK_VISION_HOST=0`,
+`STRATA_INK_EMBED_HOST=0`, `STRATA_INK_DENSE_Q8=0`, `STRATA_INK_TREE_FP8_EXACT=0`, `STRATA_INK_TREE_MIN_GAIN=<x>`,
+`STRATA_INK_TILED_ATTN=0`, `STRATA_INK_SPLITKV_GQA=0`.
+
+Still slow: prefill deep in a long context (attention dominates past ~64K); the tiled kernel is LDS-bound at
+~13% of FP32 peak, so a `v_dot2_f32_f16` variant or wider key tiles are the next lever.
+
+## RESOLVED 2026-11-27 (see above) -- possible correctness regression in `2460e04a3`
 
 `2460e04a3` is a one-line change, `__launch_bounds__(256)` -> `(256, 16)` on `k_moe_direct_w13_situ`, and its commit
 message says "bit-identical". That claim was established only at **B=1** (teacher-forced `--dump-ref` parity,
