@@ -918,7 +918,14 @@ public:
             if (name == embed_k || name == unemb_k) {
                 GpuPackedTensor pt;
                 pt.info = ti;
-                if (!upload_raw(pt.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
+                // The input embedding is a gather of one row per token (2.3 KB): keep it in mapped pinned host memory on
+                // discrete cards and give its ~440 MiB of VRAM to the KV cache. STRATA_INK_EMBED_HOST=0 keeps it in VRAM.
+                const char* eh = std::getenv("STRATA_INK_EMBED_HOST");
+                if (name == embed_k && !mem_info_.is_uma && !(eh && eh[0] == '0')) {
+                    if (!hip_ok(alloc_gpu_buffer(pt.buf, ti.bytes, false, /*prefer_uma_coherent=*/true), "embed host alloc", err)) return false;
+                    std::memcpy(pt.buf.host_ptr, sec1.data() + ti.off, ti.bytes);
+                    std::fprintf(stderr, "[ink-hip] input embedding (%.0f MiB) in mapped host memory\n", ti.bytes / 1048576.0);
+                } else if (!upload_raw(pt.buf, sec1.data() + ti.off, ti.bytes, err)) return false;
                 packed_trunk_[name] = pt;
             } else if (is_large_2d_matmul(name, ti) && dense_q8_eligible(model, name, ti)) {
                 const size_t rows = static_cast<size_t>(ti.rows()), cols = static_cast<size_t>(ti.cols());
@@ -1105,6 +1112,13 @@ public:
                     GpuBuffer b;
                     if (!upload_raw(b, bf16.data(), bf16.size() * sizeof(uint16_t), err)) return false;
                     dspark_bf16_[k] = b;
+                } else if (k == "markov_head.markov_w1.weight" && !mem_info_.is_uma &&
+                           !(std::getenv("STRATA_INK_EMBED_HOST") && std::getenv("STRATA_INK_EMBED_HOST")[0] == '0')) {
+                    // [V, rank] table read one row (prev token) per draft: mapped host memory, ~200 MiB of VRAM back
+                    GpuBuffer b;
+                    if (!hip_ok(alloc_gpu_buffer(b, f32.size() * sizeof(float), false, /*prefer_uma_coherent=*/true), "markov host alloc", err)) return false;
+                    std::memcpy(b.host_ptr, f32.data(), f32.size() * sizeof(float));
+                    dspark_f32_[k] = b;
                 } else {
                     GpuBuffer b;
                     if (!upload_raw(b, f32.data(), f32.size() * sizeof(float), err)) return false;
@@ -2382,6 +2396,8 @@ public:
 #endif
         if (!has_dspark_ || max_emit <= 0 || out_emitted == nullptr) return 0;
         if (slot < 0 || slot >= max_slots_ || !slots_[slot].allocated) return 0;
+        static const bool no_tree = [] { const char* e = std::getenv("STRATA_INK_NO_TREE"); return e && e[0] == '1'; }();
+        if (no_tree) return 0;
         auto& sl = slots_[slot];
         if (anchor_pos < 1 || sl.dspark_len < anchor_pos || anchor_pos + kTreeMaxM >= sl.max_ctx) return 0;
         if (c_.head_dim > 128 || c_.d_rel > 16 || (c_.rel_extent & 3) != 0) return 0;
